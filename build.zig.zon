@@ -1,0 +1,17 @@
+.{
+    .name = .state_tcas,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "docs",
+        "LICENSE",
+        "README.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md",
+    },
+    .fingerprint = 0xae816e0828343ce2,
+}
