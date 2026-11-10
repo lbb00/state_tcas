@@ -324,26 +324,28 @@ When testing libraries that wrap event loops, organize testing entrypoints into 
 
 If your system provides shortcuts that bypass turn gates, deprecate them or ensure they cannot be accidentally selected by `enabled()` during state space exploration.
 
-**Continuous integration pattern:** Keep ungated escape hatches in separate gap test files, and include a CI verification step to ensure that exploration harnesses do not call ungated dispatchers or invoke `explore.bfs` on live event loop instances. Adopters can use the native Zig build gate check (`addExploreGateCheck`) in `build.zig`, eliminating fragile shell/grep dependencies:
+**Continuous integration pattern:** Keep ungated escape hatches in separate gap test files, and include a CI verification step to ensure that exploration harnesses do not call ungated dispatchers or invoke `explore.bfs` on live event loop instances. Adopters can use the native Zig `explore_gate_check` artifact exported by `state_tcas` in `build.zig`, eliminating fragile shell/grep dependencies:
 
 ```zig
 // build.zig
-const st = b.dependency("state_tcas", .{ ... });
-const gate_check = st.addExploreGateCheck(b, .{
-    .rules = &.{
-        .{
-            .path = "harness/explore",
-            .forbidden_patterns = &.{ "Ungated", "dispatchEventsUngated" },
-            .extensions = &.{ ".zig" },
-        },
-        .{
-            .path = "harness/live",
-            .forbidden_patterns = &.{ "explore.bfs(" },
-            .extensions = &.{ ".zig" },
-        },
-    },
+const st = b.dependency("state_tcas", .{ .target = target, .optimize = optimize });
+const gate_exe = st.artifact("explore_gate_check");
+const gate_check = b.addRunArtifact(gate_exe);
+gate_check.setCwd(b.path("."));
+gate_check.addArgs(&.{
+    "--path", "harness/explore",
+    "--ext", ".zig",
+    "--forbid", "Ungated",
+    "--forbid", "dispatchEventsUngated",
+    "--ignore-comments",
+    "--rule-end",
+    "--path", "harness/live",
+    "--ext", ".zig",
+    "--forbid", "explore.bfs(",
+    "--ignore-comments",
+    "--rule-end",
 });
-test_step.dependOn(gate_check);
+test_step.dependOn(&gate_check.step);
 ```
 
 Legacy bash equivalent for ad-hoc terminal runs:

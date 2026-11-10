@@ -21,6 +21,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run state_tcas package tests");
     test_step.dependOn(&run_tests.step);
 
+    const gate_exe = b.addExecutable(.{
+        .name = "explore_gate_check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gate_check.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    b.installArtifact(gate_exe);
+
     const gate_step = b.step("gate-check", "Scan codebase for forbidden exploration patterns");
     const gate_check = addExploreGateCheck(b, .{
         .rules = &.{
@@ -28,6 +37,7 @@ pub fn build(b: *std.Build) void {
                 .path = "examples",
                 .forbidden_patterns = &.{"dispatchEventsUngated"},
                 .extensions = &.{".zig"},
+                .ignore_comments = true,
             },
         },
     });
@@ -126,6 +136,8 @@ pub const GateRule = struct {
     forbidden_patterns: []const []const u8,
     /// File extension filter (default: &.{ ".zig" }). If empty, matches all files.
     extensions: []const []const u8 = &.{".zig"},
+    /// When true, strips line comments (`//`, `///`, `//!`) outside quotes before pattern scanning.
+    ignore_comments: bool = false,
 };
 
 pub const ExploreGateOptions = struct {
@@ -136,6 +148,10 @@ pub const ExploreGateOptions = struct {
 /// Scans target directories/files for forbidden patterns (e.g. `Ungated` in explore
 /// harness files, or `explore.bfs` on live contexts) using Zig's standard library.
 pub fn addExploreGateCheck(b: *std.Build, options: ExploreGateOptions) *std.Build.Step {
+    // Note: Do not use b.path("src/gate_check.zig") here because `b` is provided by
+    // the caller (which may be a downstream package). b.path resolves relative to
+    // the caller's build root rather than state_tcas. @embedFile embeds the source
+    // directly, guaranteeing portability when called from any adopter project.
     const wf = b.addWriteFiles();
     const gate_src = wf.add("gate_check.zig", @embedFile("src/gate_check.zig"));
     const exe = b.addExecutable(.{
@@ -157,6 +173,9 @@ pub fn addExploreGateCheck(b: *std.Build, options: ExploreGateOptions) *std.Buil
         for (rule.forbidden_patterns) |pat| {
             run.addArg("--forbid");
             run.addArg(pat);
+        }
+        if (rule.ignore_comments) {
+            run.addArg("--ignore-comments");
         }
         run.addArg("--rule-end");
     }
