@@ -8,7 +8,7 @@
 
 ## Stability
 
-Following SemVer, `0.1.x` releases may introduce minor refinements to contracts or picture-lock byte layouts as highlighted in `CHANGELOG.md`.
+Following SemVer, `0.x` releases may introduce minor refinements to contracts or picture-lock byte layouts as highlighted in `CHANGELOG.md`.
 
 Picture lock goldens that embed Role labels must be regenerated in the same PR that changes `participant()` / `participantZh()`.
 
