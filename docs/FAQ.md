@@ -8,6 +8,14 @@ Concise answers to common architectural and integration questions. Implementatio
 
 Formal model checkers (such as TLA+ or Microsoft P) are powerful for analyzing abstract mathematical models, but require creating and maintaining a second specification in a separate language. `state_tcas` eliminates this synchronization cost by driving your existing implementation directly via test harness closures, with bounded search depths and permutation limits (`error.SearchIncomplete` on budget exhaustion).
 
+## Can `state_tcas` be used alongside TLA+ or formal specifications?
+
+**Yes.** While `state_tcas` is fully self-contained, teams with high-assurance requirements can optionally use `st.tla` for bidirectional interop without breaking the `std`-only rule:
+
+- **Vocabulary Locking (`st.tla.lock` / `st.tla.lockWithOptions`)**: Format and lock TLA+ action/state vocabularies and bounded configuration constants directly from Zig types. Test runs enforce byte-level consistency, preventing vocabulary naming and configuration drift (`error.TlaDrift`).
+- **Trace Replay & Model-Based Testing (`st.tla.replayJsonTrace` / `st.tla.replayJsonTraceWithOptions`)**: Replay JSON traces or ITF (Informal Trace Format) executions (e.g. from Apalache or Quint `--mbt`) directly against your Zig harness. It supports both standard state-only ITF traces (Apalache ADR-015, inferring transition actions between adjacent states via `enabled()` and `project()`) and action-annotated traces (`action`, `actionTaken`, `mbt::actionTaken`), payload arguments (`payload`, `mbt::nondetPicks`), single-label or multi-variable struct state projections (`state`, `after`, or struct field mappings), enabling guards (`error.ActionNotEnabled`), state divergence checks (`error.TraceDiverged`), missing action detection (`error.ActionMissing`), and counterexample expected rejection regression testing (`expect_rejection`).
+- **Pure Zig `std` Implementation**: The `tla` module is 100% pure Zig with no Java, TLC, or external CLI tool requirements in test runs.
+
 ## Can I use BFS to explore a live event loop or driver?
 
 **Generally no.** `explore.bfs` requires a value-type context that implements genuine `clone` and `destroy` operations. Stateful systems containing operating system handles, thread pools, or event loops cannot be safely deep-copied. Attempting to mock or fake a clone often masks real concurrency issues.

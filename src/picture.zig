@@ -182,7 +182,7 @@ pub fn lock(io: std.Io, allocator: std.mem.Allocator, path: []const u8, expected
     return error.PictureDrift;
 }
 
-fn matchesNormalizingCRLF(expected: []const u8, actual: []const u8) bool {
+pub fn matchesNormalizingCRLF(expected: []const u8, actual: []const u8) bool {
     var exp_i: usize = 0;
     var act_i: usize = 0;
     while (act_i < actual.len) {

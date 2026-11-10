@@ -48,9 +48,11 @@ pub fn fact(n: usize) error{Overflow}!usize {
     return v;
 }
 
+/// Skip duplicate permutations. Equality comparison uses `std.meta.eql`.
+/// Note: Pointer and slice fields are compared by address and length rather than element contents.
 pub fn skipSwap(comptime Act: type, acts: []const Act, n: usize, i: usize) bool {
     var j = n;
-    while (j < i) : (j += 1) if (acts[j] == acts[i]) return true;
+    while (j < i) : (j += 1) if (std.meta.eql(acts[j], acts[i])) return true;
     return false;
 }
 
@@ -382,4 +384,39 @@ test "render SearchIncomplete when visits mismatch expected" {
         error.SearchIncomplete,
         render(std.testing.allocator, "", "A", "B", Act, 2, seed, &story, 99, &must, &ctx),
     );
+}
+
+test "orders supports tagged union Act with payload" {
+    const Act = union(enum) {
+        push: u32,
+        pop,
+    };
+    const Ctx = struct {
+        calls: usize = 0,
+        orders_seen: usize = 0,
+        seen_push_push_pop: bool = false,
+        seen_push_pop_push: bool = false,
+        seen_pop_push_push: bool = false,
+
+        pub fn prepare(_: *@This()) !void {}
+        pub fn release(_: *@This()) void {}
+        pub fn step(self: *@This(), _: Act, _: ?*@import("picture.zig").Picture) !void {
+            self.calls += 1;
+        }
+        pub fn finish(self: *@This(), acts: []const Act) !void {
+            self.orders_seen += 1;
+            if (acts[0] == .push and acts[1] == .push and acts[2] == .pop) self.seen_push_push_pop = true;
+            if (acts[0] == .push and acts[1] == .pop and acts[2] == .push) self.seen_push_pop_push = true;
+            if (acts[0] == .pop and acts[1] == .push and acts[2] == .push) self.seen_pop_push_push = true;
+        }
+    };
+    var ctx: Ctx = .{};
+    // 3 elements with a duplicate: push(1), push(1), pop -> unique permutations should be 3! / 2! = 3
+    const seed = [_]Act{ .{ .push = 1 }, .{ .push = 1 }, .pop };
+    _ = try orders(Act, 3, seed, 10, &ctx, null);
+    try std.testing.expectEqual(@as(usize, 9), ctx.calls); // 3 orders * 3 steps each
+    try std.testing.expectEqual(@as(usize, 3), ctx.orders_seen);
+    try std.testing.expect(ctx.seen_push_push_pop);
+    try std.testing.expect(ctx.seen_push_pop_push);
+    try std.testing.expect(ctx.seen_pop_push_push);
 }

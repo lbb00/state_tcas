@@ -23,6 +23,7 @@ Hand-written test traces frequently miss subtle edge-case orderings, while forma
 | `picture` | Mermaid state/sequence diagram generator with byte-level regression locks |
 | `role` | Participant labels for sequence diagrams (`Initiator`, `Responder`, `Harness`) |
 | `trace` | Structured JSON event tracing for exploration inspection |
+| `tla` | TLA+ specification interoperability: declaration locking and ITF trace replay |
 
 `state_tcas` is not a discrete-event simulator or a full formal specification language; it is an in-process exploration toolkit designed to catch race conditions and ordering bugs directly in your implementation.
 
@@ -42,7 +43,8 @@ Following Semantic Versioning, `0.x` provides a stable core module layout. Any c
 | `exhaust` | `orders`, `play`, `publish`, `render`, `Shell`, `fact`, `SkipOrder`, `verify*` |
 | `calendar` | `Calendar`, `Timed`, `EventId`, `ClockRewind`, `clone`, `resetTo` |
 | `monitor` | `Safety`, `Liveness`, `Bundle`, `Monitored`, `MonitoredKeyed`, `KeyedOnly` |
-| `picture` | `Picture`, `Observation`, `lock` (with automatic CRLF normalization) |
+| `picture` | `Picture`, `Observation`, `lock`, `matchesNormalizingCRLF` |
+| `tla` | `formatDeclarations`, `lock`, `parseAct`, `replayJsonTrace`, `decodeItfValue`, `verifyCoverage`, `TlaError`, `ReplayStats` |
 | `role` / `trace` | Module re-exports |
 | `build.zig` | `addExploreGateCheck`, `GateRule`, `ExploreGateOptions` |
 
@@ -92,6 +94,7 @@ var calendar = st.calendar.Calendar.init(allocator);
 ```bash
 zig build test              # Run unit and contract test suites (includes gate-check)
 zig build gate-check        # Run native explore gate pattern checks
+zig build bootstrap         # Run self-bootstrapping dogfood verification suite
 zig build examples          # Build and run all example targets
 ```
 
@@ -102,6 +105,8 @@ zig build examples          # Build and run all example targets
 | `zig build example-calendar` | [`examples/toy_calendar_timeout.zig`](examples/toy_calendar_timeout.zig) | Virtual calendar deadlines, cancellation, and monotonic clock checks |
 | `zig build example-calendar-dfs` | [`examples/toy_calendar_dfs.zig`](examples/toy_calendar_dfs.zig) | Calendar snapshotting (`clone` / `resetTo`) during DFS backtracking |
 | `zig build example-act-log` | [`examples/toy_act_log_dfs.zig`](examples/toy_act_log_dfs.zig) | Action-log rebuild with DFS for stateful, non-cloneable systems |
+| `zig build example-tla-lock` | [`examples/toy_tla_lock.zig`](examples/toy_tla_lock.zig) | TLA+ declaration golden lock and ITF trace replay |
+| `zig build example-bootstrap` | [`examples/toy_bootstrap_dogfood.zig`](examples/toy_bootstrap_dogfood.zig) | Full dogfooding self-verification across Calendar, SleepSet POR, minimizeTrace, and TLA+ |
 
 ## Documentation
 

@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **TLA+ specification interoperability (`st.tla`)**:
+  - `formatDeclarations`: Automatically format TLA+ module declarations (constants, actions, states) from Zig types with string escaping (quotes, backslashes, newlines), SANY-compliant lexical identifier validation (`isValidTlaIdentifier`), compile-time rejection of collisions with standard prelude definitions (`isTlaPreludeCollision`, e.g., `Nat`, `Int`, `Seq`, `Append`, `Actions`, `Next`), and compile-time safety checks rejecting unsupported types (floating point, pointers).
+  - `lock`: Golden consistency lock for TLA+ declaration files with automatic CRLF normalization and module name validation, preventing vocabulary and configuration drift (`error.TlaDrift`).
+  - `replayJsonTrace` / `replayJsonTraceWithOptions`: Two-phase replay engine for JSON action traces, standard Apalache ADR-015 state-only traces (with adjacent-state transition inference via `enabled()` and `project()`, and `error.ActionMissing` on unreachable transitions), and action-annotated ITF/Quint traces against context harnesses. Structurally separates trace ingestion & validation (`ingestStepPlan` returning strongly-typed `StepPlan`) from domain execution & invariant verification (`executeStepPlan` returning typed `StepOutcome`), verifying enabling guards (`error.ActionNotEnabled`), single-label and strict multi-variable struct state projections (`error.TraceDiverged`, `error.ProjectionFieldMissing`, `error.ProjectionUnavailable`), verified state accounting ensuring non-trivial projection validation, initial step-0 struct projection assertions without requiring string state labels, typed state and `after` alias validation mapping non-string state assertions directly to struct projection fields, non-dispatching ITF step-0 `init` predicate semantics, Quint `mbt::nondetPicks` payload support, synonym conflict detection, and counterexample expected rejection regression testing (`expect_rejection`) with step-bounds enforcement (`error.RejectionStepOutOfBounds`) and strict setup/parser error whitelisting rejecting parser overflow and trace-parse failures (`error.InvalidExpectedRejection`).
+  - `decodeItfValue` & recursive variant adaptation: Recursive decoder for Apalache ITF wrappers (`#bigint`, `#tup`, `#set`, `#map`), type-directed recursive variant adaptation for Apalache ADT objects (`{"tag": ..., "value": ...}`) nested within structs, arrays, slices, optionals (`?T`), and tagged unions, with recursion depth protection (`error.NestingTooDeep`) and validation rejecting malformed wrappers (`error.InvalidTraceFormat`).
+  - `TlaLexer` & `checkExtends`: Reusable minimal lexical scanner (`TlaLexer`) and comment- and string-literal-aware verification utility (`checkExtends`) confirming that a TLA+ specification contains an `EXTENDS` clause for a required module outside of comments (`\*`, nested `(* ... *)`) and string literals (`"..."`), strictly terminating at the clause boundary before examining operator definitions.
+  - `deepEql`: Deep recursive structural equality comparator supporting slices, single-item pointers (including `*anyopaque` and function pointers via address identity), structs, arrays, optionals, and tagged unions.
+  - `jsonValueEql`: Dedicated recursive value equality comparator for `std.json.Value` types across numbers, strings, arrays, and associative map objects.
+  - Exported `picture.matchesNormalizingCRLF` for reusable cross-platform CRLF golden lock comparisons.
+  - `verifyCoverage`: Verification helper asserting all action branches in `Act` were exercised (`error.ActUncovered`).
+  - End-to-end example `examples/toy_tla_lock.zig` executable via `zig build example-tla-lock`.
+- **Self-bootstrapping verification suite (`src/bootstrap.zig`, `examples/toy_bootstrap_dogfood.zig`)**:
+  - Comprehensive dogfooding test suite covering `Calendar` state exploration via `dfsKeyed` with `Safety` and `Liveness` (EF Reachability) monitors with structural pending-event key hashing and active cancellation tracking; `SleepSet` partial order reduction state space preservation and negative non-commutativity detection; `ActLogReplay` state reconstruction validated in lockstep against a cloneable shadow reference model; `minimizeTrace` delta debugging fault isolation under active interfering noise; and `tla` model declaration locking against committed specifications with Apalache ITF trace replay.
+  - Dedicated build step `zig build bootstrap` (aliased to `zig build example-bootstrap`) registered in `zig build examples` and CI workflow matrix (`.github/workflows/ci.yml`).
+
+### Fixed
+
+- **Exhaustive permutation equality for tagged union `Act` (`exhaust.skipSwap`)**:
+  - Switched from operator `==` to `std.meta.eql` in `exhaust.skipSwap`, enabling support for tagged union actions with payloads under `exhaust.orders` (with pointers and slices compared by address and length).
+
 ## [0.2.1] - 2026-11-10
 
 ### Added

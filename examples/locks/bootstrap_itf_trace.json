@@ -1,0 +1,30 @@
+{
+  "#meta": {
+    "format": "ITF",
+    "description": "Calendar lifecycle bootstrap trace"
+  },
+  "states": [
+    {
+      "#meta": { "index": 0 },
+      "action": "init",
+      "state": "idle"
+    },
+    {
+      "#meta": { "index": 1 },
+      "action": "schedule",
+      "payload": { "#bigint": "100" },
+      "state": "scheduled"
+    },
+    {
+      "#meta": { "index": 2 },
+      "action": "advance",
+      "payload": { "#bigint": "100" },
+      "state": "expired"
+    },
+    {
+      "#meta": { "index": 3 },
+      "action": "fire",
+      "state": "idle"
+    }
+  ]
+}
