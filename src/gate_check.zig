@@ -12,8 +12,10 @@ pub fn checkFile(
     path: []const u8,
     forbidden_patterns: []const []const u8,
     out_violations: *usize,
+    out_files_scanned: ?*usize,
     verbose: bool,
 ) !void {
+    if (out_files_scanned) |fs| fs.* += 1;
     const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
         if (verbose) std.debug.print("Gate check error: unable to read {s}: {s}\n", .{ path, @errorName(err) });
         out_violations.* += 1;
@@ -57,6 +59,7 @@ pub fn checkDir(
     forbidden_patterns: []const []const u8,
     extensions: []const []const u8,
     out_violations: *usize,
+    out_files_scanned: ?*usize,
     verbose: bool,
 ) !void {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| {
@@ -70,7 +73,16 @@ pub fn checkDir(
     defer walker.deinit();
 
     while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
+        var is_target = false;
+        if (entry.kind == .file) {
+            is_target = true;
+        } else if (entry.kind == .sym_link) {
+            const rel = try std.fs.path.join(allocator, &.{ dir_path, entry.path });
+            defer allocator.free(rel);
+            const st = std.Io.Dir.cwd().statFile(io, rel, .{}) catch continue;
+            if (st.kind == .file) is_target = true;
+        }
+        if (!is_target) continue;
 
         if (extensions.len > 0) {
             var ext_matched = false;
@@ -86,7 +98,7 @@ pub fn checkDir(
         const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.path });
         defer allocator.free(full_path);
 
-        try checkFile(io, allocator, full_path, forbidden_patterns, out_violations, verbose);
+        try checkFile(io, allocator, full_path, forbidden_patterns, out_violations, out_files_scanned, verbose);
     }
 }
 
@@ -99,6 +111,7 @@ pub fn checkTarget(
     out_violations: *usize,
     verbose: bool,
 ) !void {
+    var files_scanned: usize = 0;
     const stat = std.Io.Dir.cwd().statFile(io, target_path, .{}) catch |err| {
         var dir = std.Io.Dir.cwd().openDir(io, target_path, .{ .iterate = true }) catch {
             if (verbose) std.debug.print("Gate check error: cannot access target path {s}: {s}\n", .{ target_path, @errorName(err) });
@@ -106,14 +119,22 @@ pub fn checkTarget(
             return;
         };
         dir.close(io);
-        try checkDir(io, allocator, target_path, forbidden_patterns, extensions, out_violations, verbose);
+        try checkDir(io, allocator, target_path, forbidden_patterns, extensions, out_violations, &files_scanned, verbose);
+        if (files_scanned == 0) {
+            if (verbose) std.debug.print("Gate check error: rule for directory '{s}' matched 0 files\n", .{target_path});
+            out_violations.* += 1;
+        }
         return;
     };
 
     if (stat.kind == .directory) {
-        try checkDir(io, allocator, target_path, forbidden_patterns, extensions, out_violations, verbose);
+        try checkDir(io, allocator, target_path, forbidden_patterns, extensions, out_violations, &files_scanned, verbose);
+        if (files_scanned == 0) {
+            if (verbose) std.debug.print("Gate check error: rule for directory '{s}' matched 0 files\n", .{target_path});
+            out_violations.* += 1;
+        }
     } else {
-        try checkFile(io, allocator, target_path, forbidden_patterns, out_violations, verbose);
+        try checkFile(io, allocator, target_path, forbidden_patterns, out_violations, &files_scanned, verbose);
     }
 }
 
@@ -127,6 +148,7 @@ pub fn main(init: std.process.Init) !void {
     var current_extensions: std.ArrayList([]const u8) = .empty;
     var current_patterns: std.ArrayList([]const u8) = .empty;
     var total_violations: usize = 0;
+    var rules_count: usize = 0;
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--path")) {
@@ -153,6 +175,7 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("Gate check error: each rule must specify both a target path and at least one forbidden pattern\n", .{});
                 std.process.exit(1);
             }
+            rules_count += 1;
             try checkTarget(
                 io,
                 allocator,
@@ -165,6 +188,9 @@ pub fn main(init: std.process.Init) !void {
             current_path = null;
             current_extensions.clearRetainingCapacity();
             current_patterns.clearRetainingCapacity();
+        } else {
+            std.debug.print("Gate check error: unrecognized argument '{s}'\n", .{arg});
+            std.process.exit(1);
         }
     }
     if (current_path != null or current_patterns.items.len > 0) {
@@ -172,6 +198,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("Gate check error: final rule must specify both a target path and at least one forbidden pattern\n", .{});
             std.process.exit(1);
         }
+        rules_count += 1;
         try checkTarget(
             io,
             allocator,
@@ -181,6 +208,11 @@ pub fn main(init: std.process.Init) !void {
             &total_violations,
             true,
         );
+    }
+
+    if (rules_count == 0) {
+        std.debug.print("Gate check error: no check rules provided (must specify at least one --path and --forbid)\n", .{});
+        std.process.exit(1);
     }
 
     if (total_violations > 0) {
@@ -204,14 +236,14 @@ test "checkFile detects forbidden pattern" {
     defer allocator.free(full_path);
 
     var violations: usize = 0;
-    try checkFile(io, allocator, full_path, &.{ "badActionPattern", "explore.bfs(" }, &violations, false);
+    try checkFile(io, allocator, full_path, &.{ "badActionPattern", "explore.bfs(" }, &violations, null, false);
     try std.testing.expectEqual(@as(usize, 1), violations);
 
     var clean_violations: usize = 0;
-    try checkFile(io, allocator, full_path, &.{"forbiddenPatternNotInFile"}, &clean_violations, false);
+    try checkFile(io, allocator, full_path, &.{"forbiddenPatternNotInFile"}, &clean_violations, null, false);
     try std.testing.expectEqual(@as(usize, 0), clean_violations);
 
     var missing_violations: usize = 0;
-    try checkFile(io, allocator, "does_not_exist_file.zig", &.{"bad"}, &missing_violations, false);
+    try checkFile(io, allocator, "does_not_exist_file.zig", &.{"bad"}, &missing_violations, null, false);
     try std.testing.expectEqual(@as(usize, 1), missing_violations);
 }

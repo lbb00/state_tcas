@@ -432,15 +432,18 @@ When independent concurrent actions can be executed in any order without changin
 
 ```zig
 pub fn commutes(self: *const @This(), a: Act, b: Act) bool {
-    // Both actions must be mutually independent:
-    // 1. Neither action disables the other (when both are enabled, executing a leaves b enabled).
-    // 2. Commutative outcome: executing a then b yields the exact same state as b then a.
-    // 3. Independent of state: commutes must be symmetric and action-intrinsic.
+    // Both actions must be mutually independent in the current state s:
+    // 1. Neither action disables the other (when both are enabled in s, executing a leaves b enabled).
+    // 2. Commutative outcome: executing a then b yields the exact same state as b then a (s · a · b = s · b · a).
     return isIndependent(a, b);
 }
 ```
 
 When present on the exploration context, `explore.dfs` and `explore.dfsKeyed` maintain a bounded sleep set (`explore.SleepSet`), pruning redundant commuting interleavings while guaranteeing full reachable state coverage. Skipped transitions increment `stats.sleep_skipped`.
+
+**State vs. transition coverage:** Partial Order Reduction guarantees full coverage of all **reachable states** ($S_{reachable}$), but intentionally skips redundant interleavings. Therefore:
+- If a harness records Mermaid diagram edges (`Picture` observations) or asserts path-dependent sequence orderings, pruned transitions will not appear in the generated picture.
+- When full transition diagrams or path-history assertions are required, omit `commutes`.
 
 ## Trace Minimization / Delta Debugging {#minimize-trace}
 

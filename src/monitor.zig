@@ -25,15 +25,12 @@ pub fn Safety(comptime Ctx: type) type {
     };
 }
 
-/// Finish-style Liveness: after a run, if `enabledFn` is true then either
-/// `note()` saw the goal or `goalFn` holds at `finish`.
-/// If `enabledFn` is false, `finish` succeeds even without the goal (disabled run).
-/// Not LTL □◇; only a harness finish check.
-/// Liveness check verifying reachability of a goal condition.
+/// Finish-style Liveness check verifying reachability of a goal condition.
 ///
-/// Semantics: `state_tcas` treats `Liveness` as monotonic branch reachability:
+/// Semantics: In `state_tcas`, `Liveness` monitors monotonic branch reachability:
 /// it verifies that at least one reachable exploration branch reaches the goal
 /// (`note()` sets `reached = true` monotonically; `undo` does not reset it).
+/// If `enabledFn` is false, `finish` succeeds even without the goal (disabled run).
 /// To assert that *every* terminal execution path reaches a goal (e.g. deadlock
 /// without goal), enforce this via `Safety` (e.g. assert when `enabled().len == 0`).
 pub fn Liveness(comptime Ctx: type) type {
