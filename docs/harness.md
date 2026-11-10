@@ -424,20 +424,23 @@ For domain-specific actors (such as engines, schedulers, or timers), pass custom
 
 When verifying Mermaid diagrams against golden markdown locks via `picture.lock`, differences in newline conventions between Windows (CRLF) and Unix (LF) checkouts can cause false `error.PictureDrift` failures.
 
-`picture.lock` automatically checks if the on-disk file matches `expected` when stripping `\r`. If it matches, the on-disk file is normalized by rewriting with `expected` (LF) and the lock check succeeds without error.
+`picture.lock` normalizes on-disk CRLF (`\r\n`) line endings to LF (`\n`) in memory during comparison without mutating disk files (safe for read-only checkouts). If `expected` matches the normalized content, verification succeeds.
 
 ## Action Commutativity & Partial Order Reduction {#commutativity}
 
-If independent concurrent actions can be executed in any order without changing the resulting system state, exploring all $N!$ orderings is wasteful. You can provide an optional commutativity predicate:
+When independent concurrent actions can be executed in any order without changing the resulting system state, exploring all $N!$ interleavings wastes exploration budget. You can provide an optional commutativity predicate:
 
 ```zig
 pub fn commutes(self: *const @This(), a: Act, b: Act) bool {
-    // Return true if applying a then b is observationally symmetric to b then a
+    // Both actions must be mutually independent:
+    // 1. Neither action disables the other (when both are enabled, executing a leaves b enabled).
+    // 2. Commutative outcome: executing a then b yields the exact same state as b then a.
+    // 3. Independent of state: commutes must be symmetric and action-intrinsic.
     return isIndependent(a, b);
 }
 ```
 
-When present on the exploration context, `explore.dfs` and `explore.dfsKeyed` maintain a bounded sleep set (`explore.SleepSet`), skipping symmetric branches and reducing search complexity from $O(N!)$ down to $O(2^N)$ or $O(N)$ canonical paths while incrementing `stats.pruned`.
+When present on the exploration context, `explore.dfs` and `explore.dfsKeyed` maintain a bounded sleep set (`explore.SleepSet`), pruning redundant commuting interleavings while guaranteeing full reachable state coverage. Skipped transitions increment `stats.sleep_skipped`.
 
 ## Trace Minimization / Delta Debugging {#minimize-trace}
 
@@ -449,10 +452,13 @@ const minimal = try st.explore.minimizeTrace(
     Harness,
     allocator,
     failing_trace,
+    error.SafetyViolation, // optional expected error filter (or null for any error)
     Harness.play,
 );
 defer allocator.free(minimal);
 ```
+
+`Harness.play` receives `*Harness` and must cleanly initialize the harness context and release any allocated resources before returning.
 
 Using Delta Debugging (ddmin), `minimizeTrace` systematically isolates the 1-minimal reproducing action sequence that still triggers the failure.
 

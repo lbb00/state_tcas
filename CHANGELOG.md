@@ -17,11 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Manages action histories, steps forward, and upon backtrack resets and replays the prefix via `RebuildFn` or `inner.reset()`.
 - **Action commutativity / Partial Order Reduction (`explore.dfs`, `explore.dfsKeyed`)**:
   - Added optional `commutes(self: *const @This(), a: Act, b: Act) bool` contract for contexts.
-  - Automatically identifies independent, commuting actions and skips redundant interleavings using bounded sleep sets (`SleepSet`), yielding exponential search budget reductions ($O(2^N)$ / $O(N)$ vs $O(N!)$).
+  - Automatically identifies independent, commuting actions and skips redundant interleavings using bounded sleep sets (`SleepSet`), pruning symmetric transitions while preserving full reachable state coverage (`stats.sleep_skipped`).
 - **Trace minimization / Delta debugging (`explore.minimizeTrace`)**:
-  - Automated Delta Debugging (ddmin) algorithm that isolates the minimal reproducing subset of actions from a failing trace by eliminating spurious intermediate actions.
+  - Automated Delta Debugging (ddmin) algorithm that isolates the minimal reproducing subset of actions from a failing trace with optional expected error filtering.
 - **Cross-platform CRLF golden lock normalization (`picture.lock`)**:
-  - Automatically detects and normalizes on-disk Windows `\r\n` (CRLF) line endings to `\n` (LF) upon matching expected pictures, preventing spurious `error.PictureDrift` across multi-platform CI runners.
+  - Automatically normalizes on-disk Windows `\r\n` (CRLF) line endings to `\n` (LF) in memory during comparison, preventing spurious `error.PictureDrift` across multi-platform CI runners without mutating disk files.
 - **Native build gate check (`build.zig` `addExploreGateCheck`)**:
   - Native Zig build step helper using `std.fs` and string searching to scan targets for forbidden patterns (e.g. `Ungated` in exploration harness files or `explore.bfs` on stateful contexts), replacing fragile shell/grep scripts.
 

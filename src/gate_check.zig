@@ -15,7 +15,8 @@ pub fn checkFile(
     verbose: bool,
 ) !void {
     const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
-        if (verbose) std.debug.print("Gate check warning: unable to read {s}: {s}\n", .{ path, @errorName(err) });
+        if (verbose) std.debug.print("Gate check error: unable to read {s}: {s}\n", .{ path, @errorName(err) });
+        out_violations.* += 1;
         return;
     };
     defer allocator.free(content);
@@ -59,7 +60,8 @@ pub fn checkDir(
     verbose: bool,
 ) !void {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| {
-        if (verbose) std.debug.print("Gate check warning: unable to open dir {s}: {s}\n", .{ dir_path, @errorName(err) });
+        if (verbose) std.debug.print("Gate check error: unable to open dir {s}: {s}\n", .{ dir_path, @errorName(err) });
+        out_violations.* += 1;
         return;
     };
     defer dir.close(io);
@@ -99,7 +101,8 @@ pub fn checkTarget(
 ) !void {
     const stat = std.Io.Dir.cwd().statFile(io, target_path, .{}) catch |err| {
         var dir = std.Io.Dir.cwd().openDir(io, target_path, .{ .iterate = true }) catch {
-            if (verbose) std.debug.print("Gate check warning: cannot access path {s}: {s}\n", .{ target_path, @errorName(err) });
+            if (verbose) std.debug.print("Gate check error: cannot access target path {s}: {s}\n", .{ target_path, @errorName(err) });
+            out_violations.* += 1;
             return;
         };
         dir.close(io);
@@ -127,39 +130,52 @@ pub fn main(init: std.process.Init) !void {
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--path")) {
-            if (it.next()) |p| {
-                current_path = p;
-            }
+            const p = it.next() orelse {
+                std.debug.print("Gate check error: --path requires a path argument\n", .{});
+                std.process.exit(1);
+            };
+            current_path = p;
         } else if (std.mem.eql(u8, arg, "--ext")) {
-            if (it.next()) |e| {
-                try current_extensions.append(allocator, e);
-            }
+            const e = it.next() orelse {
+                std.debug.print("Gate check error: --ext requires an extension argument\n", .{});
+                std.process.exit(1);
+            };
+            try current_extensions.append(allocator, e);
         } else if (std.mem.eql(u8, arg, "--forbid")) {
-            if (it.next()) |f| {
-                try current_patterns.append(allocator, f);
-            }
+            const f = it.next() orelse {
+                std.debug.print("Gate check error: --forbid requires a pattern argument\n", .{});
+                std.process.exit(1);
+            };
+            try current_patterns.append(allocator, f);
         } else if (std.mem.eql(u8, arg, "--rule-end")) {
-            if (current_path) |p| {
-                try checkTarget(
-                    io,
-                    allocator,
-                    p,
-                    current_patterns.items,
-                    current_extensions.items,
-                    &total_violations,
-                    true,
-                );
+            if (current_path == null and current_patterns.items.len == 0) continue;
+            if (current_path == null or current_patterns.items.len == 0) {
+                std.debug.print("Gate check error: each rule must specify both a target path and at least one forbidden pattern\n", .{});
+                std.process.exit(1);
             }
+            try checkTarget(
+                io,
+                allocator,
+                current_path.?,
+                current_patterns.items,
+                current_extensions.items,
+                &total_violations,
+                true,
+            );
             current_path = null;
             current_extensions.clearRetainingCapacity();
             current_patterns.clearRetainingCapacity();
         }
     }
-    if (current_path) |p| {
+    if (current_path != null or current_patterns.items.len > 0) {
+        if (current_path == null or current_patterns.items.len == 0) {
+            std.debug.print("Gate check error: final rule must specify both a target path and at least one forbidden pattern\n", .{});
+            std.process.exit(1);
+        }
         try checkTarget(
             io,
             allocator,
-            p,
+            current_path.?,
             current_patterns.items,
             current_extensions.items,
             &total_violations,
@@ -176,19 +192,26 @@ pub fn main(init: std.process.Init) !void {
 test "checkFile detects forbidden pattern" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = ".zig-cache/tmp_gate_check_test.txt";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "test_file.zig",
         .data = "pub fn testFn() void {\n    badActionPattern();\n}\n",
     });
 
+    const full_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "test_file.zig" });
+    defer allocator.free(full_path);
+
     var violations: usize = 0;
-    try checkFile(io, allocator, path, &.{ "badActionPattern", "explore.bfs(" }, &violations, false);
+    try checkFile(io, allocator, full_path, &.{ "badActionPattern", "explore.bfs(" }, &violations, false);
     try std.testing.expectEqual(@as(usize, 1), violations);
 
     var clean_violations: usize = 0;
-    try checkFile(io, allocator, path, &.{"forbiddenPatternNotInFile"}, &clean_violations, false);
+    try checkFile(io, allocator, full_path, &.{"forbiddenPatternNotInFile"}, &clean_violations, false);
     try std.testing.expectEqual(@as(usize, 0), clean_violations);
+
+    var missing_violations: usize = 0;
+    try checkFile(io, allocator, "does_not_exist_file.zig", &.{"bad"}, &missing_violations, false);
+    try std.testing.expectEqual(@as(usize, 1), missing_violations);
 }

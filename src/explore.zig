@@ -51,6 +51,7 @@ pub const Stats = struct {
     visits: usize = 0,
     expansions: usize = 0,
     pruned: usize = 0,
+    sleep_skipped: usize = 0,
 };
 
 /// Max length of one `enabled()` result copied per explore frame.
@@ -157,12 +158,12 @@ fn dfsCommutativeRec(
     var cur_sleep = sleep;
     for (acts) |act| {
         if (cur_sleep.contains(act)) {
-            stats.pruned += 1;
+            stats.sleep_skipped += 1;
             continue;
         }
         stats.expansions += 1;
-        try ctx.step(act);
         const child_sleep = cur_sleep.filterCommuting(ctx, act);
+        try ctx.step(act);
         try dfsCommutativeRec(Act, ctx, budget, stats, child_sleep);
         ctx.undo(act);
         cur_sleep.add(act);
@@ -238,6 +239,15 @@ pub fn bfs(
 /// If `RebuildFn` is provided, calls it (`fn (*Context) void` or `fn (*Context, []const Act) void`).
 /// If `RebuildFn` is null/void, calls `inner.reset()` and steps each action in history.
 pub fn ActLogReplay(comptime Act: type, comptime Context: type, comptime RebuildFn: anytype) type {
+    comptime {
+        const rf_val = RebuildFn;
+        const RFType = @TypeOf(rf_val);
+        if (RFType == @TypeOf(null) or RFType == void) {
+            if (!@hasDecl(Context, "reset")) {
+                @compileError("ActLogReplay: Context must implement reset() or a RebuildFn must be provided");
+            }
+        }
+    }
     const has_key = @hasDecl(Context, "key");
     const has_commutes = @hasDecl(Context, "commutes");
 
@@ -375,11 +385,13 @@ fn replayHelper(comptime Act: type, comptime Context: type, comptime RebuildFn: 
     if (RFType == @TypeOf(null) or RFType == void) {
         if (@hasDecl(Context, "reset")) {
             self.inner.reset();
+        } else {
+            @compileError("ActLogReplay: Context must implement reset() or a RebuildFn must be provided");
         }
-        for (self.history.items) |a| {
+        for (self.history.items, 0..) |a, i| {
             const res = self.inner.step(a);
             if (@typeInfo(@TypeOf(res)) == .error_union) {
-                res catch unreachable;
+                res catch |err| std.debug.panic("ActLogReplay: replay step {d} failed: {s}", .{ i, @errorName(err) });
             }
         }
     } else {
@@ -395,17 +407,17 @@ fn replayHelper(comptime Act: type, comptime Context: type, comptime RebuildFn: 
         if (fn_info.param_types.len == 2) {
             const ret = rf_val(self.inner, self.history.items);
             if (@typeInfo(@TypeOf(ret)) == .error_union) {
-                ret catch unreachable;
+                ret catch |err| std.debug.panic("ActLogReplay: custom replay failed: {s}", .{@errorName(err)});
             }
         } else if (fn_info.param_types.len == 1) {
             const ret = rf_val(self.inner);
             if (@typeInfo(@TypeOf(ret)) == .error_union) {
-                ret catch unreachable;
+                ret catch |err| std.debug.panic("ActLogReplay: reset failed: {s}", .{@errorName(err)});
             }
-            for (self.history.items) |a| {
+            for (self.history.items, 0..) |a, i| {
                 const res = self.inner.step(a);
                 if (@typeInfo(@TypeOf(res)) == .error_union) {
-                    res catch unreachable;
+                    res catch |err| std.debug.panic("ActLogReplay: replay step {d} failed: {s}", .{ i, @errorName(err) });
                 }
             }
         } else {
@@ -576,12 +588,12 @@ fn dfsKeyedCommutativeRec(
     var cur_sleep = sleep;
     for (acts) |act| {
         if (cur_sleep.contains(act)) {
-            stats.pruned += 1;
+            stats.sleep_skipped += 1;
             continue;
         }
         stats.expansions += 1;
-        try ctx.step(act);
         const child_sleep = cur_sleep.filterCommuting(ctx, act);
+        try ctx.step(act);
         try dfsKeyedCommutativeRec(Act, Key, ctx, budget, stats, visited, child_sleep);
         ctx.undo(act);
         cur_sleep.add(act);
@@ -590,15 +602,26 @@ fn dfsKeyedCommutativeRec(
 
 /// Given a failing sequence of actions, iteratively removes redundant intermediate
 /// actions using Delta Debugging (ddmin), returning a 1-minimal reproducing action sequence.
+///
+/// If `expected_error` is non-null, only errors matching `expected_error` are treated as
+/// reproducing the failure; unexpected errors (e.g. OutOfMemory) are treated as non-reproducing.
+///
+/// The caller-provided `play_fn` must cleanly initialize `*Ctx` (and deinitialize any
+/// resources upon return).
 pub fn minimizeTrace(
     comptime Act: type,
     comptime Ctx: type,
     allocator: std.mem.Allocator,
     failing_trace: []const Act,
+    expected_error: ?anyerror,
     play_fn: *const fn (*Ctx, []const Act) anyerror!void,
 ) ![]Act {
-    if (!checkCandidate(Act, Ctx, play_fn, failing_trace)) {
+    if (!checkCandidate(Act, Ctx, play_fn, expected_error, failing_trace)) {
         return error.TraceDidNotFail;
+    }
+
+    if (checkCandidate(Act, Ctx, play_fn, expected_error, &.{})) {
+        return try allocator.alloc(Act, 0);
     }
 
     var current = try allocator.dupe(Act, failing_trace);
@@ -628,7 +651,7 @@ pub fn minimizeTrace(
                 @memcpy(comp[0..start], current[0..start]);
                 @memcpy(comp[start..], current[end..]);
 
-                if (checkCandidate(Act, Ctx, play_fn, comp)) {
+                if (checkCandidate(Act, Ctx, play_fn, expected_error, comp)) {
                     allocator.free(current);
                     current = comp;
                     n = if (n > 2) n - 1 else 2;
@@ -653,7 +676,7 @@ pub fn minimizeTrace(
                     const chunk = current[start..end];
                     const cand = try allocator.dupe(Act, chunk);
                     errdefer allocator.free(cand);
-                    if (checkCandidate(Act, Ctx, play_fn, cand)) {
+                    if (checkCandidate(Act, Ctx, play_fn, expected_error, cand)) {
                         allocator.free(current);
                         current = cand;
                         n = 2;
@@ -683,12 +706,16 @@ fn checkCandidate(
     comptime Act: type,
     comptime Ctx: type,
     play_fn: *const fn (*Ctx, []const Act) anyerror!void,
+    expected_error: ?anyerror,
     cand: []const Act,
 ) bool {
     var ctx: Ctx = undefined;
     if (play_fn(&ctx, cand)) |_| {
         return false;
-    } else |_| {
+    } else |err| {
+        if (expected_error) |exp| {
+            return err == exp;
+        }
         return true;
     }
 }
@@ -1198,11 +1225,11 @@ test "action commutativity yields exponential search savings" {
 
     try std.testing.expectEqual(@as(usize, 32), stats_comm.visits);
     try std.testing.expectEqual(@as(usize, 31), stats_comm.expansions);
-    try std.testing.expect(stats_comm.pruned >= 40);
+    try std.testing.expect(stats_comm.sleep_skipped >= 40);
 
     try std.testing.expectEqual(@as(usize, 326), stats_no_comm.visits);
     try std.testing.expectEqual(@as(usize, 325), stats_no_comm.expansions);
-    try std.testing.expectEqual(@as(usize, 0), stats_no_comm.pruned);
+    try std.testing.expectEqual(@as(usize, 0), stats_no_comm.sleep_skipped);
 
     // Exponential search budget reduction (O(2^N) vs O(N!))
     try std.testing.expect(stats_no_comm.visits > stats_comm.visits * 10);
@@ -1230,14 +1257,17 @@ test "minimizeTrace reduces spurious actions to minimal reproducing subset" {
     };
 
     const noisy_trace = &[_]Act{ .setup, .noisy, .ping, .junk, .bad, .noisy, .noisy, .trigger, .junk };
-    const minimal = try minimizeTrace(Act, BugHarness, std.testing.allocator, noisy_trace, BugHarness.play);
+    const minimal = try minimizeTrace(Act, BugHarness, std.testing.allocator, noisy_trace, error.AssertionFailed, BugHarness.play);
     defer std.testing.allocator.free(minimal);
 
     try std.testing.expectEqualSlices(Act, &[_]Act{ .ping, .bad, .trigger }, minimal);
 
     // Non-failing trace returns error.TraceDidNotFail
     const ok_trace = &[_]Act{ .setup, .ping, .junk };
-    try std.testing.expectError(error.TraceDidNotFail, minimizeTrace(Act, BugHarness, std.testing.allocator, ok_trace, BugHarness.play));
+    try std.testing.expectError(error.TraceDidNotFail, minimizeTrace(Act, BugHarness, std.testing.allocator, ok_trace, error.AssertionFailed, BugHarness.play));
+
+    // Mismatched expected error returns error.TraceDidNotFail
+    try std.testing.expectError(error.TraceDidNotFail, minimizeTrace(Act, BugHarness, std.testing.allocator, noisy_trace, error.OutOfMemory, BugHarness.play));
 
     // Already-minimal single action failure
     const SingleHarness = struct {
@@ -1249,7 +1279,19 @@ test "minimizeTrace reduces spurious actions to minimal reproducing subset" {
         }
     };
     const single_trace = &[_]Act{.bad};
-    const min_single = try minimizeTrace(Act, SingleHarness, std.testing.allocator, single_trace, SingleHarness.play);
+    const min_single = try minimizeTrace(Act, SingleHarness, std.testing.allocator, single_trace, error.AssertionFailed, SingleHarness.play);
     defer std.testing.allocator.free(min_single);
     try std.testing.expectEqualSlices(Act, &[_]Act{.bad}, min_single);
+
+    // Empty trace failure test
+    const EmptyHarness = struct {
+        fn play(ctx: *@This(), trace: []const Act) !void {
+            _ = ctx;
+            _ = trace;
+            return error.AssertionFailed;
+        }
+    };
+    const min_empty = try minimizeTrace(Act, EmptyHarness, std.testing.allocator, noisy_trace, error.AssertionFailed, EmptyHarness.play);
+    defer std.testing.allocator.free(min_empty);
+    try std.testing.expectEqualSlices(Act, &[_]Act{}, min_empty);
 }

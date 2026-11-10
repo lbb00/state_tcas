@@ -175,23 +175,23 @@ pub fn lock(io: std.Io, allocator: std.mem.Allocator, path: []const u8, expected
     };
     defer allocator.free(actual);
     if (std.mem.eql(u8, expected, actual)) return;
-    // Cross-platform CRLF normalization: if on-disk file has Windows '\r\n'
-    // but matches expected when stripped of '\r', rewrite with expected (LF)
-    // and succeed, eliminating false PictureDrift across runners.
-    if (std.mem.indexOfScalar(u8, actual, '\r') != null and matchesStrippingCR(expected, actual)) {
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = expected });
-        return;
-    }
+    // Cross-platform CRLF normalization (read-only): if on-disk file has Windows
+    // '\r\n' line endings but matches expected LF line endings, succeed without
+    // mutating the disk file (safe in read-only checkouts).
+    if (matchesNormalizingCRLF(expected, actual)) return;
     return error.PictureDrift;
 }
 
-fn matchesStrippingCR(expected: []const u8, actual: []const u8) bool {
+fn matchesNormalizingCRLF(expected: []const u8, actual: []const u8) bool {
     var exp_i: usize = 0;
     var act_i: usize = 0;
-    while (act_i < actual.len) : (act_i += 1) {
-        if (actual[act_i] == '\r') continue;
+    while (act_i < actual.len) {
+        if (actual[act_i] == '\r' and act_i + 1 < actual.len and actual[act_i + 1] == '\n') {
+            act_i += 1; // skip \r, actual[act_i] is now '\n'
+        }
         if (exp_i >= expected.len) return false;
         if (actual[act_i] != expected[exp_i]) return false;
+        act_i += 1;
         exp_i += 1;
     }
     return exp_i == expected.len;
@@ -319,27 +319,36 @@ test "sequence arrow can name its own ends" {
     try std.testing.expect(std.mem.indexOf(u8, text, "participant 默认甲") != null);
 }
 
-test "lock normalizes CRLF on-disk content to LF expected and succeeds" {
+test "lock normalizes CRLF on-disk content to LF expected and succeeds without mutating disk" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = ".zig-cache/tmp_crlf_lock_test.txt";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     const crlf_content = "```mermaid\r\nstateDiagram-v2\r\n    idle --> done: go\r\n```\r\n";
     const lf_expected = "```mermaid\nstateDiagram-v2\n    idle --> done: go\n```\n";
 
-    // Write CRLF to disk
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = crlf_content });
+    // Direct CRLF normalization unit tests
+    try std.testing.expect(matchesNormalizingCRLF(lf_expected, crlf_content));
+    try std.testing.expect(matchesNormalizingCRLF("a\nb\n", "a\r\nb\r\n"));
+    try std.testing.expect(!matchesNormalizingCRLF("ab", "a\rb")); // isolated \r is NOT stripped
+    try std.testing.expect(!matchesNormalizingCRLF("different\n", crlf_content));
 
-    // lock with LF expected succeeds via automatic normalization
-    try lock(io, allocator, path, lf_expected);
+    const full_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "diagram.md" });
+    defer allocator.free(full_path);
 
-    // Verify on-disk file was rewritten with LF
-    const normalized = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024));
-    defer allocator.free(normalized);
-    try std.testing.expectEqualStrings(lf_expected, normalized);
+    // File lock test: writes CRLF to temp file
+    try tmp.dir.writeFile(io, .{ .sub_path = "diagram.md", .data = crlf_content });
 
-    // Non-matching CRLF content still returns PictureDrift
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "different\r\ncontent\r\n" });
-    try std.testing.expectError(error.PictureDrift, lock(io, allocator, path, lf_expected));
+    // lock with LF expected succeeds via read-only normalization
+    try lock(io, allocator, full_path, lf_expected);
+
+    // Verify on-disk file was NOT mutated (preserved as-is for read-only safety)
+    const disk_bytes = try tmp.dir.readFileAlloc(io, "diagram.md", allocator, .limited(1024));
+    defer allocator.free(disk_bytes);
+    try std.testing.expectEqualStrings(crlf_content, disk_bytes);
+
+    // Non-matching content still returns PictureDrift
+    try tmp.dir.writeFile(io, .{ .sub_path = "diagram.md", .data = "different\r\ncontent\r\n" });
+    try std.testing.expectError(error.PictureDrift, lock(io, allocator, full_path, lf_expected));
 }
