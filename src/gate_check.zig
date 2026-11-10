@@ -74,6 +74,7 @@ pub fn checkDir(
 
     while (try walker.next(io)) |entry| {
         var is_target = false;
+        // Follow symlinks that resolve to files; skip symlinked directories to prevent recursion cycles.
         if (entry.kind == .file) {
             is_target = true;
         } else if (entry.kind == .sym_link) {
@@ -156,6 +157,10 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("Gate check error: --path requires a path argument\n", .{});
                 std.process.exit(1);
             };
+            if (current_path != null) {
+                std.debug.print("Gate check error: multiple --path arguments specified within a single rule\n", .{});
+                std.process.exit(1);
+            }
             current_path = p;
         } else if (std.mem.eql(u8, arg, "--ext")) {
             const e = it.next() orelse {
