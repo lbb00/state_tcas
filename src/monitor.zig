@@ -4,6 +4,7 @@
 //! (eventually / enabled-then-must). Not LTL, not a production conformance pipe.
 
 const std = @import("std");
+const explore = @import("explore.zig");
 
 pub const SafetyError = error{
     SafetyViolation,
@@ -45,6 +46,167 @@ pub fn Liveness(comptime Ctx: type) type {
             }
         }
     };
+}
+
+/// Generic adapter wrapping an inner world context with attached Safety and
+/// Liveness monitors. On `step(act)`, calls `inner.step(act)`, `saf.observe()`,
+/// and `liv.note()`. Forwards `enabled()` and `undo(act)` to `inner`.
+pub fn Monitored(comptime Act: type, comptime World: type) type {
+    const has_commutes = @hasDecl(World, "commutes");
+    if (has_commutes) {
+        return struct {
+            inner: *World,
+            saf: *Safety(*World),
+            liv: *Liveness(*World),
+
+            pub fn enabled(self: *@This()) []const Act {
+                return self.inner.enabled();
+            }
+
+            pub fn step(self: *@This(), act: Act) !void {
+                try self.inner.step(act);
+                try self.saf.observe();
+                self.liv.note();
+            }
+
+            pub fn undo(self: *@This(), act: Act) void {
+                self.inner.undo(act);
+            }
+
+            pub fn commutes(self: *const @This(), a: Act, b: Act) bool {
+                return self.inner.commutes(a, b);
+            }
+        };
+    } else {
+        return struct {
+            inner: *World,
+            saf: *Safety(*World),
+            liv: *Liveness(*World),
+
+            pub fn enabled(self: *@This()) []const Act {
+                return self.inner.enabled();
+            }
+
+            pub fn step(self: *@This(), act: Act) !void {
+                try self.inner.step(act);
+                try self.saf.observe();
+                self.liv.note();
+            }
+
+            pub fn undo(self: *@This(), act: Act) void {
+                self.inner.undo(act);
+            }
+        };
+    }
+}
+
+/// Generic adapter identical to `Monitored` plus forwarding `key()` from
+/// `inner.key()` to satisfy `verifyDfsKeyed`.
+pub fn MonitoredKeyed(comptime Act: type, comptime World: type) type {
+    const has_commutes = @hasDecl(World, "commutes");
+    if (has_commutes) {
+        return struct {
+            inner: *World,
+            saf: *Safety(*World),
+            liv: *Liveness(*World),
+
+            pub fn enabled(self: *@This()) []const Act {
+                return self.inner.enabled();
+            }
+
+            pub fn step(self: *@This(), act: Act) !void {
+                try self.inner.step(act);
+                try self.saf.observe();
+                self.liv.note();
+            }
+
+            pub fn undo(self: *@This(), act: Act) void {
+                self.inner.undo(act);
+            }
+
+            pub fn key(self: *const @This()) @TypeOf(self.inner.key()) {
+                return self.inner.key();
+            }
+
+            pub fn commutes(self: *const @This(), a: Act, b: Act) bool {
+                return self.inner.commutes(a, b);
+            }
+        };
+    } else {
+        return struct {
+            inner: *World,
+            saf: *Safety(*World),
+            liv: *Liveness(*World),
+
+            pub fn enabled(self: *@This()) []const Act {
+                return self.inner.enabled();
+            }
+
+            pub fn step(self: *@This(), act: Act) !void {
+                try self.inner.step(act);
+                try self.saf.observe();
+                self.liv.note();
+            }
+
+            pub fn undo(self: *@This(), act: Act) void {
+                self.inner.undo(act);
+            }
+
+            pub fn key(self: *const @This()) @TypeOf(self.inner.key()) {
+                return self.inner.key();
+            }
+        };
+    }
+}
+
+/// Generic adapter forwarding `enabled`, `step`, `undo`, and `key` to `inner`.
+pub fn KeyedOnly(comptime Act: type, comptime World: type) type {
+    const has_commutes = @hasDecl(World, "commutes");
+    if (has_commutes) {
+        return struct {
+            inner: *World,
+
+            pub fn enabled(self: *@This()) []const Act {
+                return self.inner.enabled();
+            }
+
+            pub fn step(self: *@This(), act: Act) !void {
+                try self.inner.step(act);
+            }
+
+            pub fn undo(self: *@This(), act: Act) void {
+                self.inner.undo(act);
+            }
+
+            pub fn key(self: *const @This()) @TypeOf(self.inner.key()) {
+                return self.inner.key();
+            }
+
+            pub fn commutes(self: *const @This(), a: Act, b: Act) bool {
+                return self.inner.commutes(a, b);
+            }
+        };
+    } else {
+        return struct {
+            inner: *World,
+
+            pub fn enabled(self: *@This()) []const Act {
+                return self.inner.enabled();
+            }
+
+            pub fn step(self: *@This(), act: Act) !void {
+                try self.inner.step(act);
+            }
+
+            pub fn undo(self: *@This(), act: Act) void {
+                self.inner.undo(act);
+            }
+
+            pub fn key(self: *const @This()) @TypeOf(self.inner.key()) {
+                return self.inner.key();
+            }
+        };
+    }
 }
 
 /// Bundles Safety + optional Liveness for exhaust `step` or calendar `fireDue`.
@@ -134,4 +296,81 @@ test "Bundle afterStep hooks Safety then Liveness note" {
     box.goal = true;
     try bun.finish();
     try std.testing.expect(bun.liveness.?.reached or bun.liveness.?.goalFn(&box));
+}
+
+test "Monitored, MonitoredKeyed, KeyedOnly adapters verify and run" {
+    const Act = enum { a, b };
+    const Model = struct {
+        state: u8 = 0,
+        bad: bool = false,
+        goal: bool = false,
+
+        pub fn enabled(self: *@This()) []const Act {
+            if (self.state == 0) return &[_]Act{ .a, .b };
+            return &[_]Act{};
+        }
+        pub fn step(self: *@This(), act: Act) !void {
+            switch (act) {
+                .a => self.state = 1,
+                .b => {
+                    self.state = 2;
+                    self.goal = true;
+                },
+            }
+        }
+        pub fn undo(self: *@This(), act: Act) void {
+            _ = act;
+            self.state = 0;
+            self.goal = false;
+        }
+        pub fn key(self: *const @This()) u64 {
+            return self.state;
+        }
+        pub fn checkSafety(self: *@This()) !void {
+            if (self.bad) return error.SafetyViolation;
+        }
+        pub fn isEnabled(_: *@This()) bool {
+            return true;
+        }
+        pub fn isGoal(self: *@This()) bool {
+            return self.goal;
+        }
+    };
+
+    // 1. Monitored satisfies verifyDfs and runs under explore.dfs
+    explore.verifyDfs(Act, *Monitored(Act, Model));
+    var model: Model = .{};
+    var saf = Safety(*Model){ .ctx = &model, .checkFn = Model.checkSafety };
+    var liv = Liveness(*Model){ .ctx = &model, .enabledFn = Model.isEnabled, .goalFn = Model.isGoal };
+    var monitored = Monitored(Act, Model){ .inner = &model, .saf = &saf, .liv = &liv };
+
+    var stats1: explore.Stats = .{};
+    try explore.dfs(Act, &monitored, 16, &stats1);
+    try std.testing.expect(saf.observations >= 2);
+    try std.testing.expect(liv.reached);
+    try liv.finish();
+
+    // 2. MonitoredKeyed satisfies verifyDfsKeyed and runs under explore.dfsKeyed
+    explore.verifyDfsKeyed(Act, u64, *MonitoredKeyed(Act, Model));
+    var model2: Model = .{};
+    var saf2 = Safety(*Model){ .ctx = &model2, .checkFn = Model.checkSafety };
+    var liv2 = Liveness(*Model){ .ctx = &model2, .enabledFn = Model.isEnabled, .goalFn = Model.isGoal };
+    var mon_keyed = MonitoredKeyed(Act, Model){ .inner = &model2, .saf = &saf2, .liv = &liv2 };
+
+    var stats2: explore.Stats = .{};
+    var visited = std.AutoHashMap(u64, void).init(std.testing.allocator);
+    defer visited.deinit();
+    try explore.dfsKeyed(Act, u64, &mon_keyed, 16, &stats2, &visited);
+    try std.testing.expect(saf2.observations >= 2);
+    try std.testing.expect(liv2.reached);
+
+    // 3. KeyedOnly satisfies verifyDfsKeyed and runs under explore.dfsKeyed
+    explore.verifyDfsKeyed(Act, u64, *KeyedOnly(Act, Model));
+    var model3: Model = .{};
+    var keyed_only = KeyedOnly(Act, Model){ .inner = &model3 };
+    var stats3: explore.Stats = .{};
+    var visited2 = std.AutoHashMap(u64, void).init(std.testing.allocator);
+    defer visited2.deinit();
+    try explore.dfsKeyed(Act, u64, &keyed_only, 16, &stats3, &visited2);
+    try std.testing.expect(stats3.visits >= 2);
 }

@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Generic duck adapters (`monitor.Monitored`, `monitor.MonitoredKeyed`, `monitor.KeyedOnly`)**:
+  - Eliminates boilerplate wrapper code for attaching `Safety` and `Liveness` monitors to state machine contexts under `explore.dfs` and `explore.dfsKeyed`.
+  - Re-exported under root namespace for convenient access.
+- **Action-log replay adapter (`explore.ActLogReplay`)**:
+  - Generic wrapper for live/stateful systems that cannot implement genuine `clone()` and require action-log replay for DFS backtracking.
+  - Manages action histories, steps forward, and upon backtrack resets and replays the prefix via `RebuildFn` or `inner.reset()`.
+- **Action commutativity / Partial Order Reduction (`explore.dfs`, `explore.dfsKeyed`)**:
+  - Added optional `commutes(self: *const @This(), a: Act, b: Act) bool` contract for contexts.
+  - Automatically identifies independent, commuting actions and skips redundant interleavings using bounded sleep sets (`SleepSet`), yielding exponential search budget reductions ($O(2^N)$ / $O(N)$ vs $O(N!)$).
+- **Trace minimization / Delta debugging (`explore.minimizeTrace`)**:
+  - Automated Delta Debugging (ddmin) algorithm that isolates the minimal reproducing subset of actions from a failing trace by eliminating spurious intermediate actions.
+- **Cross-platform CRLF golden lock normalization (`picture.lock`)**:
+  - Automatically detects and normalizes on-disk Windows `\r\n` (CRLF) line endings to `\n` (LF) upon matching expected pictures, preventing spurious `error.PictureDrift` across multi-platform CI runners.
+- **Native build gate check (`build.zig` `addExploreGateCheck`)**:
+  - Native Zig build step helper using `std.fs` and string searching to scan targets for forbidden patterns (e.g. `Ungated` in exploration harness files or `explore.bfs` on stateful contexts), replacing fragile shell/grep scripts.
+
 ## [0.1.0] - 2026-11-09
 
 ### Added

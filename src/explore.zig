@@ -64,12 +64,48 @@ fn copyEnabled(comptime Act: type, src: []const Act) error{EnabledSetTooLarge}!s
     return .{ .buf = buf, .len = src.len };
 }
 
+/// Bounded sleep set tracking actions that commute with the current exploration
+/// path, skipping redundant interleavings in Partial Order Reduction.
+pub fn SleepSet(comptime Act: type) type {
+    return struct {
+        items: [max_enabled]Act = undefined,
+        len: usize = 0,
+
+        pub fn contains(self: *const @This(), act: Act) bool {
+            for (self.items[0..self.len]) |item| {
+                if (std.meta.eql(item, act)) return true;
+            }
+            return false;
+        }
+
+        pub fn add(self: *@This(), act: Act) void {
+            if (!self.contains(act) and self.len < max_enabled) {
+                self.items[self.len] = act;
+                self.len += 1;
+            }
+        }
+
+        pub fn filterCommuting(self: *const @This(), ctx: anytype, act: Act) @This() {
+            var res: @This() = .{};
+            for (self.items[0..self.len]) |item| {
+                if (ctx.commutes(item, act)) {
+                    res.items[res.len] = item;
+                    res.len += 1;
+                }
+            }
+            return res;
+        }
+    };
+}
+
 /// Depth-first bounded explore with undo backtrack.
 ///
 /// Ctx: `enabled` / `step` / `undo` (`undo` must be void; `verifyDfs` checks decl
 /// presence — void is enforced by the `ctx.undo(act)` call site; docs/harness.md#dfs).
 /// Each frame copies `enabled()` into a stack buffer (`max_enabled`) so a shared
 /// harness `acts_buf` rewritten by child frames cannot corrupt the parent loop.
+/// If `ctx` exposes `commutes(self, a, b) bool`, redundant commuting interleavings
+/// are automatically pruned via sleep sets (Partial Order Reduction).
 pub fn dfs(
     comptime Act: type,
     ctx: anytype,
@@ -77,7 +113,12 @@ pub fn dfs(
     stats: *Stats,
 ) !void {
     verifyDfs(Act, @TypeOf(ctx));
-    try dfsRec(Act, ctx, budget, stats);
+    const has_commutes = @hasDecl(Unwrap(@TypeOf(ctx)), "commutes");
+    if (has_commutes) {
+        try dfsCommutativeRec(Act, ctx, budget, stats, .{});
+    } else {
+        try dfsRec(Act, ctx, budget, stats);
+    }
 }
 
 fn dfsRec(
@@ -97,6 +138,34 @@ fn dfsRec(
         try ctx.step(act);
         try dfsRec(Act, ctx, budget, stats);
         ctx.undo(act);
+    }
+}
+
+fn dfsCommutativeRec(
+    comptime Act: type,
+    ctx: anytype,
+    budget: usize,
+    stats: *Stats,
+    sleep: SleepSet(Act),
+) !void {
+    if (stats.visits >= budget) return error.SearchIncomplete;
+    stats.visits += 1;
+    const owned = try copyEnabled(Act, ctx.enabled());
+    const acts = owned.buf[0..owned.len];
+    if (acts.len == 0) return;
+
+    var cur_sleep = sleep;
+    for (acts) |act| {
+        if (cur_sleep.contains(act)) {
+            stats.pruned += 1;
+            continue;
+        }
+        stats.expansions += 1;
+        try ctx.step(act);
+        const child_sleep = cur_sleep.filterCommuting(ctx, act);
+        try dfsCommutativeRec(Act, ctx, budget, stats, child_sleep);
+        ctx.undo(act);
+        cur_sleep.add(act);
     }
 }
 
@@ -156,6 +225,191 @@ pub fn bfs(
                 return error.SearchIncomplete;
             }
             try queue.append(allocator, child);
+        }
+    }
+}
+
+/// Generic adapter for live/stateful systems that cannot implement genuine `clone()`
+/// and require action-log replay for DFS backtracking.
+///
+/// Manages an action history using `std.ArrayList(Act)`.
+/// `step(act)` appends to history and steps the inner context.
+/// `undo(act)` pops from history, resets the inner context, and replays the recorded prefix.
+/// If `RebuildFn` is provided, calls it (`fn (*Context) void` or `fn (*Context, []const Act) void`).
+/// If `RebuildFn` is null/void, calls `inner.reset()` and steps each action in history.
+pub fn ActLogReplay(comptime Act: type, comptime Context: type, comptime RebuildFn: anytype) type {
+    const has_key = @hasDecl(Context, "key");
+    const has_commutes = @hasDecl(Context, "commutes");
+
+    if (has_key) {
+        if (has_commutes) {
+            return struct {
+                const Self = @This();
+                inner: *Context,
+                allocator: std.mem.Allocator,
+                history: std.ArrayList(Act) = .empty,
+
+                pub fn init(allocator: std.mem.Allocator, inner: *Context) Self {
+                    return .{ .inner = inner, .allocator = allocator, .history = .empty };
+                }
+                pub fn deinit(self: *Self) void {
+                    self.history.deinit(self.allocator);
+                }
+                pub fn enabled(self: *Self) []const Act {
+                    return self.inner.enabled();
+                }
+                pub fn step(self: *Self, act: Act) !void {
+                    try self.history.append(self.allocator, act);
+                    errdefer _ = self.history.pop();
+                    try self.inner.step(act);
+                }
+                pub fn undo(self: *Self, act: Act) void {
+                    _ = act;
+                    _ = self.history.pop();
+                    replayHelper(Act, Context, RebuildFn, self);
+                }
+                pub fn key(self: *const Self) @TypeOf(self.inner.key()) {
+                    return self.inner.key();
+                }
+                pub fn commutes(self: *const Self, a: Act, b: Act) bool {
+                    return self.inner.commutes(a, b);
+                }
+            };
+        } else {
+            return struct {
+                const Self = @This();
+                inner: *Context,
+                allocator: std.mem.Allocator,
+                history: std.ArrayList(Act) = .empty,
+
+                pub fn init(allocator: std.mem.Allocator, inner: *Context) Self {
+                    return .{ .inner = inner, .allocator = allocator, .history = .empty };
+                }
+                pub fn deinit(self: *Self) void {
+                    self.history.deinit(self.allocator);
+                }
+                pub fn enabled(self: *Self) []const Act {
+                    return self.inner.enabled();
+                }
+                pub fn step(self: *Self, act: Act) !void {
+                    try self.history.append(self.allocator, act);
+                    errdefer _ = self.history.pop();
+                    try self.inner.step(act);
+                }
+                pub fn undo(self: *Self, act: Act) void {
+                    _ = act;
+                    _ = self.history.pop();
+                    replayHelper(Act, Context, RebuildFn, self);
+                }
+                pub fn key(self: *const Self) @TypeOf(self.inner.key()) {
+                    return self.inner.key();
+                }
+            };
+        }
+    } else {
+        if (has_commutes) {
+            return struct {
+                const Self = @This();
+                inner: *Context,
+                allocator: std.mem.Allocator,
+                history: std.ArrayList(Act) = .empty,
+
+                pub fn init(allocator: std.mem.Allocator, inner: *Context) Self {
+                    return .{ .inner = inner, .allocator = allocator, .history = .empty };
+                }
+                pub fn deinit(self: *Self) void {
+                    self.history.deinit(self.allocator);
+                }
+                pub fn enabled(self: *Self) []const Act {
+                    return self.inner.enabled();
+                }
+                pub fn step(self: *Self, act: Act) !void {
+                    try self.history.append(self.allocator, act);
+                    errdefer _ = self.history.pop();
+                    try self.inner.step(act);
+                }
+                pub fn undo(self: *Self, act: Act) void {
+                    _ = act;
+                    _ = self.history.pop();
+                    replayHelper(Act, Context, RebuildFn, self);
+                }
+                pub fn commutes(self: *const Self, a: Act, b: Act) bool {
+                    return self.inner.commutes(a, b);
+                }
+            };
+        } else {
+            return struct {
+                const Self = @This();
+                inner: *Context,
+                allocator: std.mem.Allocator,
+                history: std.ArrayList(Act) = .empty,
+
+                pub fn init(allocator: std.mem.Allocator, inner: *Context) Self {
+                    return .{ .inner = inner, .allocator = allocator, .history = .empty };
+                }
+                pub fn deinit(self: *Self) void {
+                    self.history.deinit(self.allocator);
+                }
+                pub fn enabled(self: *Self) []const Act {
+                    return self.inner.enabled();
+                }
+                pub fn step(self: *Self, act: Act) !void {
+                    try self.history.append(self.allocator, act);
+                    errdefer _ = self.history.pop();
+                    try self.inner.step(act);
+                }
+                pub fn undo(self: *Self, act: Act) void {
+                    _ = act;
+                    _ = self.history.pop();
+                    replayHelper(Act, Context, RebuildFn, self);
+                }
+            };
+        }
+    }
+}
+
+fn replayHelper(comptime Act: type, comptime Context: type, comptime RebuildFn: anytype, self: anytype) void {
+    _ = Act;
+    const rf_val = RebuildFn;
+    const RFType = @TypeOf(rf_val);
+    if (RFType == @TypeOf(null) or RFType == void) {
+        if (@hasDecl(Context, "reset")) {
+            self.inner.reset();
+        }
+        for (self.history.items) |a| {
+            const res = self.inner.step(a);
+            if (@typeInfo(@TypeOf(res)) == .error_union) {
+                res catch unreachable;
+            }
+        }
+    } else {
+        const info = @typeInfo(RFType);
+        const fn_info = switch (info) {
+            .@"fn" => |f| f,
+            .pointer => |p| switch (@typeInfo(p.child)) {
+                .@"fn" => |f| f,
+                else => @compileError("RebuildFn must be a function, function pointer, or null"),
+            },
+            else => @compileError("RebuildFn must be a function, function pointer, or null"),
+        };
+        if (fn_info.param_types.len == 2) {
+            const ret = rf_val(self.inner, self.history.items);
+            if (@typeInfo(@TypeOf(ret)) == .error_union) {
+                ret catch unreachable;
+            }
+        } else if (fn_info.param_types.len == 1) {
+            const ret = rf_val(self.inner);
+            if (@typeInfo(@TypeOf(ret)) == .error_union) {
+                ret catch unreachable;
+            }
+            for (self.history.items) |a| {
+                const res = self.inner.step(a);
+                if (@typeInfo(@TypeOf(res)) == .error_union) {
+                    res catch unreachable;
+                }
+            }
+        } else {
+            @compileError("RebuildFn must accept (*Context) or (*Context, []const Act)");
         }
     }
 }
@@ -262,7 +516,12 @@ pub fn dfsKeyed(
     visited: *std.AutoHashMap(Key, void),
 ) !void {
     verifyDfsKeyed(Act, Key, @TypeOf(ctx));
-    try dfsKeyedRec(Act, Key, ctx, budget, stats, visited);
+    const has_commutes = @hasDecl(Unwrap(@TypeOf(ctx)), "commutes");
+    if (has_commutes) {
+        try dfsKeyedCommutativeRec(Act, Key, ctx, budget, stats, visited, .{});
+    } else {
+        try dfsKeyedRec(Act, Key, ctx, budget, stats, visited);
+    }
 }
 
 fn dfsKeyedRec(
@@ -290,6 +549,147 @@ fn dfsKeyedRec(
         try ctx.step(act);
         try dfsKeyedRec(Act, Key, ctx, budget, stats, visited);
         ctx.undo(act);
+    }
+}
+
+fn dfsKeyedCommutativeRec(
+    comptime Act: type,
+    comptime Key: type,
+    ctx: anytype,
+    budget: usize,
+    stats: *Stats,
+    visited: *std.AutoHashMap(Key, void),
+    sleep: SleepSet(Act),
+) !void {
+    if (stats.visits >= budget) return error.SearchIncomplete;
+    const k = ctx.key();
+    if (visited.contains(k)) {
+        stats.pruned += 1;
+        return;
+    }
+    try visited.put(k, {});
+    stats.visits += 1;
+    const owned = try copyEnabled(Act, ctx.enabled());
+    const acts = owned.buf[0..owned.len];
+    if (acts.len == 0) return;
+
+    var cur_sleep = sleep;
+    for (acts) |act| {
+        if (cur_sleep.contains(act)) {
+            stats.pruned += 1;
+            continue;
+        }
+        stats.expansions += 1;
+        try ctx.step(act);
+        const child_sleep = cur_sleep.filterCommuting(ctx, act);
+        try dfsKeyedCommutativeRec(Act, Key, ctx, budget, stats, visited, child_sleep);
+        ctx.undo(act);
+        cur_sleep.add(act);
+    }
+}
+
+/// Given a failing sequence of actions, iteratively removes redundant intermediate
+/// actions using Delta Debugging (ddmin), returning a 1-minimal reproducing action sequence.
+pub fn minimizeTrace(
+    comptime Act: type,
+    comptime Ctx: type,
+    allocator: std.mem.Allocator,
+    failing_trace: []const Act,
+    play_fn: *const fn (*Ctx, []const Act) anyerror!void,
+) ![]Act {
+    if (!checkCandidate(Act, Ctx, play_fn, failing_trace)) {
+        return error.TraceDidNotFail;
+    }
+
+    var current = try allocator.dupe(Act, failing_trace);
+    errdefer allocator.free(current);
+
+    if (current.len <= 1) {
+        return current;
+    }
+
+    var n: usize = 2;
+    while (current.len >= 2) {
+        if (n > current.len) n = current.len;
+        const chunk_size = current.len / n;
+        const remainder = current.len % n;
+
+        var reduced = false;
+
+        // 1. Test complements: for each chunk i, test current without chunk i.
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sz = chunk_size + @as(usize, if (i < remainder) 1 else 0);
+            const end = start + sz;
+            if (sz > 0 and sz < current.len) {
+                const comp = try allocator.alloc(Act, current.len - sz);
+                errdefer allocator.free(comp);
+                @memcpy(comp[0..start], current[0..start]);
+                @memcpy(comp[start..], current[end..]);
+
+                if (checkCandidate(Act, Ctx, play_fn, comp)) {
+                    allocator.free(current);
+                    current = comp;
+                    n = if (n > 2) n - 1 else 2;
+                    reduced = true;
+                    break;
+                } else {
+                    allocator.free(comp);
+                }
+            }
+            start = end;
+        }
+        if (reduced) continue;
+
+        // 2. Test chunks: if n > 2, test each chunk i directly.
+        if (n > 2) {
+            start = 0;
+            i = 0;
+            while (i < n) : (i += 1) {
+                const sz = chunk_size + @as(usize, if (i < remainder) 1 else 0);
+                const end = start + sz;
+                if (sz > 0 and sz < current.len) {
+                    const chunk = current[start..end];
+                    const cand = try allocator.dupe(Act, chunk);
+                    errdefer allocator.free(cand);
+                    if (checkCandidate(Act, Ctx, play_fn, cand)) {
+                        allocator.free(current);
+                        current = cand;
+                        n = 2;
+                        reduced = true;
+                        break;
+                    } else {
+                        allocator.free(cand);
+                    }
+                }
+                start = end;
+            }
+            if (reduced) continue;
+        }
+
+        // 3. Increase granularity if no reduction at current n.
+        if (n < current.len) {
+            n = @min(n * 2, current.len);
+        } else {
+            break;
+        }
+    }
+
+    return current;
+}
+
+fn checkCandidate(
+    comptime Act: type,
+    comptime Ctx: type,
+    play_fn: *const fn (*Ctx, []const Act) anyerror!void,
+    cand: []const Act,
+) bool {
+    var ctx: Ctx = undefined;
+    if (play_fn(&ctx, cand)) |_| {
+        return false;
+    } else |_| {
+        return true;
     }
 }
 
@@ -640,4 +1040,216 @@ test "branching FSM undo restores fire observable" {
     try std.testing.expectEqual(Phase.idle, toy.phase);
     try std.testing.expect(!toy.saw_fire);
     try std.testing.expect(stats.expansions >= 3);
+}
+
+test "ActLogReplay generic wrapper works with dfs and dfsKeyed" {
+    const Act = enum { inc, add2 };
+    const LiveSUT = struct {
+        val: u8 = 0,
+        acts_buf: [2]Act = undefined,
+
+        pub fn reset(self: *@This()) void {
+            self.val = 0;
+        }
+        pub fn enabled(self: *@This()) []const Act {
+            if (self.val >= 3) return self.acts_buf[0..0];
+            self.acts_buf[0] = .inc;
+            self.acts_buf[1] = .add2;
+            return self.acts_buf[0..2];
+        }
+        pub fn step(self: *@This(), act: Act) !void {
+            switch (act) {
+                .inc => self.val +%= 1,
+                .add2 => self.val +%= 2,
+            }
+        }
+    };
+
+    // 1. Plain DFS with ActLogReplay (inner has no undo, only reset)
+    var sut1: LiveSUT = .{};
+    var replay1 = ActLogReplay(Act, LiveSUT, null).init(std.testing.allocator, &sut1);
+    defer replay1.deinit();
+
+    verifyDfs(Act, @TypeOf(&replay1));
+    var stats1: Stats = .{};
+    try dfs(Act, &replay1, 64, &stats1);
+    try std.testing.expect(stats1.visits > 3);
+    try std.testing.expectEqual(@as(usize, 0), replay1.history.items.len);
+    try std.testing.expectEqual(@as(u8, 0), sut1.val);
+
+    // 2. Keyed DFS with ActLogReplay
+    const LiveSUTKeyed = struct {
+        val: u8 = 0,
+        acts_buf: [2]Act = undefined,
+
+        pub fn reset(self: *@This()) void {
+            self.val = 0;
+        }
+        pub fn enabled(self: *@This()) []const Act {
+            if (self.val >= 3) return self.acts_buf[0..0];
+            self.acts_buf[0] = .inc;
+            self.acts_buf[1] = .add2;
+            return self.acts_buf[0..2];
+        }
+        pub fn step(self: *@This(), act: Act) !void {
+            switch (act) {
+                .inc => self.val +%= 1,
+                .add2 => self.val +%= 2,
+            }
+        }
+        pub fn key(self: *const @This()) u64 {
+            return self.val;
+        }
+    };
+
+    var sut2: LiveSUTKeyed = .{};
+    var replay2 = ActLogReplay(Act, LiveSUTKeyed, null).init(std.testing.allocator, &sut2);
+    defer replay2.deinit();
+
+    verifyDfsKeyed(Act, u64, @TypeOf(&replay2));
+    var stats2: Stats = .{};
+    var visited = std.AutoHashMap(u64, void).init(std.testing.allocator);
+    defer visited.deinit();
+    try dfsKeyed(Act, u64, &replay2, 64, &stats2, &visited);
+    try std.testing.expect(stats2.pruned >= 1);
+    try std.testing.expectEqual(@as(usize, 0), replay2.history.items.len);
+    try std.testing.expectEqual(@as(u8, 0), sut2.val);
+
+    // 3. Custom RebuildFn
+    const CustomRebuilder = struct {
+        fn resetFn(s: *LiveSUT) void {
+            s.val = 0;
+        }
+    };
+    var sut3: LiveSUT = .{};
+    var replay3 = ActLogReplay(Act, LiveSUT, CustomRebuilder.resetFn).init(std.testing.allocator, &sut3);
+    defer replay3.deinit();
+    var stats3: Stats = .{};
+    try dfs(Act, &replay3, 64, &stats3);
+    try std.testing.expectEqual(@as(u8, 0), sut3.val);
+}
+
+test "action commutativity yields exponential search savings" {
+    const Act = enum { a, b, c, d, e };
+
+    const CommutingModel = struct {
+        mask: u5 = 0,
+        buf: [5]Act = undefined,
+
+        pub fn enabled(self: *@This()) []const Act {
+            var len: usize = 0;
+            inline for (std.meta.tags(Act), 0..) |tag, i| {
+                const bit: u5 = @as(u5, 1) << @intCast(i);
+                if ((self.mask & bit) == 0) {
+                    self.buf[len] = tag;
+                    len += 1;
+                }
+            }
+            return self.buf[0..len];
+        }
+        pub fn step(self: *@This(), act: Act) !void {
+            const bit: u5 = @as(u5, 1) << @intCast(@backingInt(act));
+            self.mask |= bit;
+        }
+        pub fn undo(self: *@This(), act: Act) void {
+            const bit: u5 = @as(u5, 1) << @intCast(@backingInt(act));
+            self.mask &= ~bit;
+        }
+        pub fn commutes(_: *const @This(), _: Act, _: Act) bool {
+            return true;
+        }
+    };
+
+    const NonCommutingModel = struct {
+        mask: u5 = 0,
+        buf: [5]Act = undefined,
+
+        pub fn enabled(self: *@This()) []const Act {
+            var len: usize = 0;
+            inline for (std.meta.tags(Act), 0..) |tag, i| {
+                const bit: u5 = @as(u5, 1) << @intCast(i);
+                if ((self.mask & bit) == 0) {
+                    self.buf[len] = tag;
+                    len += 1;
+                }
+            }
+            return self.buf[0..len];
+        }
+        pub fn step(self: *@This(), act: Act) !void {
+            const bit: u5 = @as(u5, 1) << @intCast(@backingInt(act));
+            self.mask |= bit;
+        }
+        pub fn undo(self: *@This(), act: Act) void {
+            const bit: u5 = @as(u5, 1) << @intCast(@backingInt(act));
+            self.mask &= ~bit;
+        }
+    };
+
+    // With commutativity: explores each reachable state in the hypercube exactly once (2^5 = 32)
+    // without redundant interleavings
+    var cm: CommutingModel = .{};
+    var stats_comm: Stats = .{};
+    try dfs(Act, &cm, 1000, &stats_comm);
+
+    // Without commutativity: explores all 5! = 120 full paths (326 total visits)
+    var ncm: NonCommutingModel = .{};
+    var stats_no_comm: Stats = .{};
+    try dfs(Act, &ncm, 1000, &stats_no_comm);
+
+    try std.testing.expectEqual(@as(usize, 32), stats_comm.visits);
+    try std.testing.expectEqual(@as(usize, 31), stats_comm.expansions);
+    try std.testing.expect(stats_comm.pruned >= 40);
+
+    try std.testing.expectEqual(@as(usize, 326), stats_no_comm.visits);
+    try std.testing.expectEqual(@as(usize, 325), stats_no_comm.expansions);
+    try std.testing.expectEqual(@as(usize, 0), stats_no_comm.pruned);
+
+    // Exponential search budget reduction (O(2^N) vs O(N!))
+    try std.testing.expect(stats_no_comm.visits > stats_comm.visits * 10);
+}
+
+test "minimizeTrace reduces spurious actions to minimal reproducing subset" {
+    const Act = enum { setup, ping, noisy, bad, junk, trigger };
+
+    const BugHarness = struct {
+        fn play(ctx: *@This(), trace: []const Act) !void {
+            _ = ctx;
+            var saw_ping = false;
+            var saw_bad = false;
+            for (trace) |a| {
+                switch (a) {
+                    .ping => saw_ping = true,
+                    .bad => if (saw_ping) {
+                        saw_bad = true;
+                    },
+                    .trigger => if (saw_ping and saw_bad) return error.AssertionFailed,
+                    else => {},
+                }
+            }
+        }
+    };
+
+    const noisy_trace = &[_]Act{ .setup, .noisy, .ping, .junk, .bad, .noisy, .noisy, .trigger, .junk };
+    const minimal = try minimizeTrace(Act, BugHarness, std.testing.allocator, noisy_trace, BugHarness.play);
+    defer std.testing.allocator.free(minimal);
+
+    try std.testing.expectEqualSlices(Act, &[_]Act{ .ping, .bad, .trigger }, minimal);
+
+    // Non-failing trace returns error.TraceDidNotFail
+    const ok_trace = &[_]Act{ .setup, .ping, .junk };
+    try std.testing.expectError(error.TraceDidNotFail, minimizeTrace(Act, BugHarness, std.testing.allocator, ok_trace, BugHarness.play));
+
+    // Already-minimal single action failure
+    const SingleHarness = struct {
+        fn play(ctx: *@This(), trace: []const Act) !void {
+            _ = ctx;
+            for (trace) |a| {
+                if (a == .bad) return error.AssertionFailed;
+            }
+        }
+    };
+    const single_trace = &[_]Act{.bad};
+    const min_single = try minimizeTrace(Act, SingleHarness, std.testing.allocator, single_trace, SingleHarness.play);
+    defer std.testing.allocator.free(min_single);
+    try std.testing.expectEqualSlices(Act, &[_]Act{.bad}, min_single);
 }

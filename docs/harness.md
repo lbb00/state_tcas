@@ -221,6 +221,25 @@ Instead, use **action-log rebuild with DFS**:
 2. On backtracking or branch divergence, rebuild the system state from a baseline origin and replay the recorded prefix.
 3. Apply `dfs` or `dfsKeyed` with a defined visit budget.
 
+### Using `explore.ActLogReplay` (Recommended)
+
+`state_tcas` provides `explore.ActLogReplay` to eliminate manual log array and rollback boilerplate:
+
+```zig
+const Act = enum { tick, tock };
+
+var sut: LiveSUT = .{}; // Implements enabled(), step(), and reset()
+var replay = st.explore.ActLogReplay(Act, LiveSUT, null).init(allocator, &sut);
+defer replay.deinit();
+
+var stats: st.explore.Stats = .{};
+try st.explore.dfs(Act, &replay, 64, &stats);
+```
+
+If your SUT uses a custom reset or replay routine, pass it as `RebuildFn` (`fn (*LiveSUT) void` or `fn (*LiveSUT, []const Act) void`). If `LiveSUT` exposes `key()` or `commutes()`, `ActLogReplay` forwards them transparently to support `dfsKeyed` and commutativity pruning.
+
+### Manual Action-Log Pattern
+
 Minimal reference implementation (replace `apply` and `boot` with your SUT APIs). Runnable example: [`examples/toy_act_log_dfs.zig`](../examples/toy_act_log_dfs.zig).
 
 ```zig
@@ -305,12 +324,33 @@ When testing libraries that wrap event loops, organize testing entrypoints into 
 
 If your system provides shortcuts that bypass turn gates, deprecate them or ensure they cannot be accidentally selected by `enabled()` during state space exploration.
 
-**Continuous integration pattern:** Keep ungated escape hatches in separate gap test files, and include a CI verification step (e.g. using `ripgrep`) to ensure that exploration harnesses do not call ungated dispatchers or invoke `explore.bfs` on live event loop instances:
+**Continuous integration pattern:** Keep ungated escape hatches in separate gap test files, and include a CI verification step to ensure that exploration harnesses do not call ungated dispatchers or invoke `explore.bfs` on live event loop instances. Adopters can use the native Zig build gate check (`addExploreGateCheck`) in `build.zig`, eliminating fragile shell/grep dependencies:
+
+```zig
+// build.zig
+const st = b.dependency("state_tcas", .{ ... });
+const gate_check = st.addExploreGateCheck(b, .{
+    .rules = &.{
+        .{
+            .path = "harness/explore",
+            .forbidden_patterns = &.{ "Ungated", "dispatchEventsUngated" },
+            .extensions = &.{ ".zig" },
+        },
+        .{
+            .path = "harness/live",
+            .forbidden_patterns = &.{ "explore.bfs(" },
+            .extensions = &.{ ".zig" },
+        },
+    },
+});
+test_step.dependOn(gate_check);
+```
+
+Legacy bash equivalent for ad-hoc terminal runs:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-# Ensure exploration harnesses only invoke production-gated turn methods
 if rg -n 'Ungated|dispatchEventsUngated' harness/explore ; then
   echo "Error: Ungated helper referenced in exploration harness" >&2
   exit 1
@@ -325,6 +365,30 @@ fi
 
 Safety / Liveness stay outside explore/exhaust decls. Wrap `step` to call
 `observe` / `note` — see `examples/toy_fsm.zig`.
+
+### Generic Adapters (`Monitored` / `MonitoredKeyed` / `KeyedOnly`)
+
+To avoid writing boilerplate wrapper structs in every harness, use `monitor.Monitored` or `monitor.MonitoredKeyed`:
+
+```zig
+var world: World = .{};
+var saf = st.monitor.Safety(*World){ .ctx = &world, .checkFn = World.checkSafety };
+var liv = st.monitor.Liveness(*World){ .ctx = &world, .enabledFn = World.isEnabled, .goalFn = World.isGoal };
+
+// Wraps inner, calls step(), saf.observe(), and liv.note(), forwarding enabled() and undo()
+var mon = st.monitor.Monitored(Act, World){
+    .inner = &world,
+    .saf = &saf,
+    .liv = &liv,
+};
+
+var stats: st.explore.Stats = .{};
+try st.explore.dfs(Act, &mon, 64, &stats);
+```
+
+For keyed DFS, use `monitor.MonitoredKeyed(Act, World)` (forwards `key()` as well). If you only need `key()` forwarding without monitors, use `monitor.KeyedOnly(Act, World)`.
+
+### Manual Monitoring Pattern
 
 **Safety:** check a **diff since the last observe**, not a sticky “last byte
 forever” flag. Snapshot before the step (or keep `prev_len`) and assert only
@@ -356,6 +420,42 @@ The `Role` enum defines core participant categories (`initiator`, `responder`, `
 
 For domain-specific actors (such as engines, schedulers, or timers), pass custom strings directly to `Observation.from` and `Observation.to`.
 
+## Picture Lock Normalization {#picture-lock}
+
+When verifying Mermaid diagrams against golden markdown locks via `picture.lock`, differences in newline conventions between Windows (CRLF) and Unix (LF) checkouts can cause false `error.PictureDrift` failures.
+
+`picture.lock` automatically checks if the on-disk file matches `expected` when stripping `\r`. If it matches, the on-disk file is normalized by rewriting with `expected` (LF) and the lock check succeeds without error.
+
+## Action Commutativity & Partial Order Reduction {#commutativity}
+
+If independent concurrent actions can be executed in any order without changing the resulting system state, exploring all $N!$ orderings is wasteful. You can provide an optional commutativity predicate:
+
+```zig
+pub fn commutes(self: *const @This(), a: Act, b: Act) bool {
+    // Return true if applying a then b is observationally symmetric to b then a
+    return isIndependent(a, b);
+}
+```
+
+When present on the exploration context, `explore.dfs` and `explore.dfsKeyed` maintain a bounded sleep set (`explore.SleepSet`), skipping symmetric branches and reducing search complexity from $O(N!)$ down to $O(2^N)$ or $O(N)$ canonical paths while incrementing `stats.pruned`.
+
+## Trace Minimization / Delta Debugging {#minimize-trace}
+
+When state exploration discovers a failing sequence of actions containing irrelevant spurious steps, use `explore.minimizeTrace`:
+
+```zig
+const minimal = try st.explore.minimizeTrace(
+    Act,
+    Harness,
+    allocator,
+    failing_trace,
+    Harness.play,
+);
+defer allocator.free(minimal);
+```
+
+Using Delta Debugging (ddmin), `minimizeTrace` systematically isolates the 1-minimal reproducing action sequence that still triggers the failure.
+
 ## Summary of Exploration Contracts
 
 | Context Method | DFS (`dfs`) | Keyed DFS (`dfsKeyed`) | BFS (`bfs`) |
@@ -364,5 +464,6 @@ For domain-specific actors (such as engines, schedulers, or timers), pass custom
 | `step(act)` | Required | Required | Required |
 | `undo(act)` | Required (`void`) | Required (`void`) | Not used |
 | `key()` | Not used | Required | Required |
+| `commutes(a, b)` | Optional | Optional | Not used |
 | `clone()` | Not used | Not used | Required |
 | `destroy()` | Not used | Not used | Required |

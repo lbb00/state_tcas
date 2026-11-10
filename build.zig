@@ -21,6 +21,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run state_tcas package tests");
     test_step.dependOn(&run_tests.step);
 
+    const gate_step = b.step("gate-check", "Scan codebase for forbidden exploration patterns");
+    const gate_check = addExploreGateCheck(b, .{
+        .rules = &.{
+            .{
+                .path = "examples",
+                .forbidden_patterns = &.{"dispatchEventsUngated"},
+                .extensions = &.{".zig"},
+            },
+        },
+    });
+    gate_step.dependOn(gate_check);
+    test_step.dependOn(gate_check);
+
     const toy = b.addExecutable(.{
         .name = "toy_fsm",
         .root_module = b.createModule(.{
@@ -104,4 +117,48 @@ pub fn build(b: *std.Build) void {
     examples.dependOn(example_cal);
     examples.dependOn(example_cal_dfs);
     examples.dependOn(example_act_log);
+}
+
+pub const GateRule = struct {
+    /// Target path (directory or file relative to build root).
+    path: []const u8,
+    /// Forbidden patterns that must not appear in any scanned file.
+    forbidden_patterns: []const []const u8,
+    /// File extension filter (default: &.{ ".zig" }). If empty, matches all files.
+    extensions: []const []const u8 = &.{".zig"},
+};
+
+pub const ExploreGateOptions = struct {
+    rules: []const GateRule,
+};
+
+/// Expose a native Zig build step helper for adopters.
+/// Scans target directories/files for forbidden patterns (e.g. `Ungated` in explore
+/// harness files, or `explore.bfs` on live contexts) using Zig's standard library.
+pub fn addExploreGateCheck(b: *std.Build, options: ExploreGateOptions) *std.Build.Step {
+    const wf = b.addWriteFiles();
+    const gate_src = wf.add("gate_check.zig", @embedFile("src/gate_check.zig"));
+    const exe = b.addExecutable(.{
+        .name = "explore_gate_check",
+        .root_module = b.createModule(.{
+            .root_source_file = gate_src,
+            .target = b.graph.host,
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.setCwd(b.path("."));
+    for (options.rules) |rule| {
+        run.addArg("--path");
+        run.addArg(rule.path);
+        for (rule.extensions) |ext| {
+            run.addArg("--ext");
+            run.addArg(ext);
+        }
+        for (rule.forbidden_patterns) |pat| {
+            run.addArg("--forbid");
+            run.addArg(pat);
+        }
+        run.addArg("--rule-end");
+    }
+    return &run.step;
 }

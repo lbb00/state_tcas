@@ -38,14 +38,15 @@ Following Semantic Versioning, `0.1.x` provides a stable core module layout. Any
 
 | Module | Primary Public APIs |
 |--------|---------------------|
-| `explore` | `dfs`, `dfsKeyed`, `bfs`, `shuffleSeeded`, `Stats`, `max_enabled`, `verify*` |
+| `explore` | `dfs`, `dfsKeyed`, `bfs`, `shuffleSeeded`, `ActLogReplay`, `minimizeTrace`, `SleepSet`, `Stats`, `max_enabled`, `verify*` |
 | `exhaust` | `orders`, `play`, `publish`, `render`, `Shell`, `fact`, `SkipOrder`, `verify*` |
 | `calendar` | `Calendar`, `Timed`, `EventId`, `ClockRewind`, `clone`, `resetTo` |
-| `monitor` | `Safety`, `Liveness`, `Bundle` |
-| `picture` | `Picture`, `Observation`, `lock` |
+| `monitor` | `Safety`, `Liveness`, `Bundle`, `Monitored`, `MonitoredKeyed`, `KeyedOnly` |
+| `picture` | `Picture`, `Observation`, `lock` (with automatic CRLF normalization) |
 | `role` / `trace` | Module re-exports |
+| `build.zig` | `addExploreGateCheck`, `GateRule`, `ExploreGateOptions` |
 
-Root re-exports these namespaces as well as convenience aliases for `Picture` and `Role`. Internal recursion helpers (`dfsRec`, `dfsKeyedRec`) are private.
+Root re-exports these namespaces as well as convenience aliases for `Picture`, `Role`, `Monitored`, `MonitoredKeyed`, and `KeyedOnly`. Internal recursion helpers (`dfsRec`, `dfsKeyedRec`) are private.
 
 ## Installation
 
@@ -89,7 +90,8 @@ var calendar = st.calendar.Calendar.init(allocator);
 ## Running Tests & Examples
 
 ```bash
-zig build test              # Run unit and contract test suites
+zig build test              # Run unit and contract test suites (includes gate-check)
+zig build gate-check        # Run native explore gate pattern checks
 zig build examples          # Build and run all example targets
 ```
 

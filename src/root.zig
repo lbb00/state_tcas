@@ -28,6 +28,9 @@ pub const explore = explore_mod;
 
 pub const Picture = picture_mod.Picture;
 pub const Role = role_mod.Role;
+pub const Monitored = monitor_mod.Monitored;
+pub const MonitoredKeyed = monitor_mod.MonitoredKeyed;
+pub const KeyedOnly = monitor_mod.KeyedOnly;
 
 test {
     // Imported file tests are part of this package's own test run.
@@ -38,4 +41,5 @@ test {
     _ = calendar_mod;
     _ = monitor_mod;
     _ = explore_mod;
+    _ = @import("gate_check.zig");
 }
