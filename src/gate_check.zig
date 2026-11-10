@@ -6,11 +6,51 @@
 
 const std = @import("std");
 
+/// Strip line comments (`//`, `///`, `//!`) outside string and character literals.
+/// Preserves multi-line string literals starting with `\\`.
+pub fn stripComments(line: []const u8) []const u8 {
+    var in_str = false;
+    var in_char = false;
+    var escape = false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (c == '\\') {
+            if (in_str or in_char) {
+                escape = true;
+                continue;
+            }
+            // Outside string and character literals: check for multi-line string `\\`
+            if (i + 1 < line.len and line[i + 1] == '\\') {
+                return line;
+            }
+            continue;
+        }
+        if (c == '"' and !in_char) {
+            in_str = !in_str;
+            continue;
+        }
+        if (c == '\'' and !in_str) {
+            in_char = !in_char;
+            continue;
+        }
+        if (!in_str and !in_char and c == '/' and i + 1 < line.len and line[i + 1] == '/') {
+            return line[0..i];
+        }
+    }
+    return line;
+}
+
 pub fn checkFile(
     io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     forbidden_patterns: []const []const u8,
+    ignore_comments: bool,
     out_violations: *usize,
     out_files_scanned: ?*usize,
     verbose: bool,
@@ -33,8 +73,10 @@ pub fn checkFile(
             line = line[0 .. line.len - 1];
         }
 
+        const effective_line = if (ignore_comments) stripComments(line) else line;
+
         for (forbidden_patterns) |pat| {
-            if (std.mem.indexOf(u8, line, pat) != null) {
+            if (std.mem.indexOf(u8, effective_line, pat) != null) {
                 out_violations.* += 1;
                 if (verbose) {
                     std.debug.print("Error: forbidden pattern '{s}' found in {s}:{d}: {s}\n", .{
@@ -58,6 +100,7 @@ pub fn checkDir(
     dir_path: []const u8,
     forbidden_patterns: []const []const u8,
     extensions: []const []const u8,
+    ignore_comments: bool,
     out_violations: *usize,
     out_files_scanned: ?*usize,
     verbose: bool,
@@ -99,7 +142,7 @@ pub fn checkDir(
         const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.path });
         defer allocator.free(full_path);
 
-        try checkFile(io, allocator, full_path, forbidden_patterns, out_violations, out_files_scanned, verbose);
+        try checkFile(io, allocator, full_path, forbidden_patterns, ignore_comments, out_violations, out_files_scanned, verbose);
     }
 }
 
@@ -109,6 +152,7 @@ pub fn checkTarget(
     target_path: []const u8,
     forbidden_patterns: []const []const u8,
     extensions: []const []const u8,
+    ignore_comments: bool,
     out_violations: *usize,
     verbose: bool,
 ) !void {
@@ -120,7 +164,7 @@ pub fn checkTarget(
             return;
         };
         dir.close(io);
-        try checkDir(io, allocator, target_path, forbidden_patterns, extensions, out_violations, &files_scanned, verbose);
+        try checkDir(io, allocator, target_path, forbidden_patterns, extensions, ignore_comments, out_violations, &files_scanned, verbose);
         if (files_scanned == 0) {
             if (verbose) std.debug.print("Gate check error: rule for directory '{s}' matched 0 files\n", .{target_path});
             out_violations.* += 1;
@@ -129,13 +173,24 @@ pub fn checkTarget(
     };
 
     if (stat.kind == .directory) {
-        try checkDir(io, allocator, target_path, forbidden_patterns, extensions, out_violations, &files_scanned, verbose);
+        try checkDir(io, allocator, target_path, forbidden_patterns, extensions, ignore_comments, out_violations, &files_scanned, verbose);
         if (files_scanned == 0) {
             if (verbose) std.debug.print("Gate check error: rule for directory '{s}' matched 0 files\n", .{target_path});
             out_violations.* += 1;
         }
     } else {
-        try checkFile(io, allocator, target_path, forbidden_patterns, out_violations, &files_scanned, verbose);
+        try checkFile(io, allocator, target_path, forbidden_patterns, ignore_comments, out_violations, &files_scanned, verbose);
+    }
+}
+
+fn validatePatterns(patterns: []const []const u8, ignore_comments: bool) void {
+    if (ignore_comments) {
+        for (patterns) |pat| {
+            if (std.mem.indexOf(u8, pat, "//") != null) {
+                std.debug.print("Gate check error: forbidden pattern '{s}' contains '//' which cannot match when --ignore-comments is enabled\n", .{pat});
+                std.process.exit(1);
+            }
+        }
     }
 }
 
@@ -148,6 +203,7 @@ pub fn main(init: std.process.Init) !void {
     var current_path: ?[]const u8 = null;
     var current_extensions: std.ArrayList([]const u8) = .empty;
     var current_patterns: std.ArrayList([]const u8) = .empty;
+    var current_ignore_comments: bool = false;
     var total_violations: usize = 0;
     var rules_count: usize = 0;
 
@@ -174,12 +230,21 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             try current_patterns.append(allocator, f);
+        } else if (std.mem.eql(u8, arg, "--ignore-comments")) {
+            current_ignore_comments = true;
         } else if (std.mem.eql(u8, arg, "--rule-end")) {
-            if (current_path == null and current_patterns.items.len == 0) continue;
+            if (current_path == null and current_patterns.items.len == 0) {
+                if (current_extensions.items.len > 0 or current_ignore_comments) {
+                    std.debug.print("Gate check error: rule specified options without both target path and forbidden pattern\n", .{});
+                    std.process.exit(1);
+                }
+                continue;
+            }
             if (current_path == null or current_patterns.items.len == 0) {
                 std.debug.print("Gate check error: each rule must specify both a target path and at least one forbidden pattern\n", .{});
                 std.process.exit(1);
             }
+            validatePatterns(current_patterns.items, current_ignore_comments);
             rules_count += 1;
             try checkTarget(
                 io,
@@ -187,22 +252,25 @@ pub fn main(init: std.process.Init) !void {
                 current_path.?,
                 current_patterns.items,
                 current_extensions.items,
+                current_ignore_comments,
                 &total_violations,
                 true,
             );
             current_path = null;
             current_extensions.clearRetainingCapacity();
             current_patterns.clearRetainingCapacity();
+            current_ignore_comments = false;
         } else {
             std.debug.print("Gate check error: unrecognized argument '{s}'\n", .{arg});
             std.process.exit(1);
         }
     }
-    if (current_path != null or current_patterns.items.len > 0) {
+    if (current_path != null or current_patterns.items.len > 0 or current_extensions.items.len > 0 or current_ignore_comments) {
         if (current_path == null or current_patterns.items.len == 0) {
             std.debug.print("Gate check error: final rule must specify both a target path and at least one forbidden pattern\n", .{});
             std.process.exit(1);
         }
+        validatePatterns(current_patterns.items, current_ignore_comments);
         rules_count += 1;
         try checkTarget(
             io,
@@ -210,6 +278,7 @@ pub fn main(init: std.process.Init) !void {
             current_path.?,
             current_patterns.items,
             current_extensions.items,
+            current_ignore_comments,
             &total_violations,
             true,
         );
@@ -241,14 +310,65 @@ test "checkFile detects forbidden pattern" {
     defer allocator.free(full_path);
 
     var violations: usize = 0;
-    try checkFile(io, allocator, full_path, &.{ "badActionPattern", "explore.bfs(" }, &violations, null, false);
+    try checkFile(io, allocator, full_path, &.{ "badActionPattern", "explore.bfs(" }, false, &violations, null, false);
     try std.testing.expectEqual(@as(usize, 1), violations);
 
     var clean_violations: usize = 0;
-    try checkFile(io, allocator, full_path, &.{"forbiddenPatternNotInFile"}, &clean_violations, null, false);
+    try checkFile(io, allocator, full_path, &.{"forbiddenPatternNotInFile"}, false, &clean_violations, null, false);
     try std.testing.expectEqual(@as(usize, 0), clean_violations);
 
     var missing_violations: usize = 0;
-    try checkFile(io, allocator, "does_not_exist_file.zig", &.{"bad"}, &missing_violations, null, false);
+    try checkFile(io, allocator, "does_not_exist_file.zig", &.{"bad"}, false, &missing_violations, null, false);
     try std.testing.expectEqual(@as(usize, 1), missing_violations);
+}
+
+test "stripComments and ignore_comments flag" {
+    try std.testing.expectEqualStrings("const a = 1; ", stripComments("const a = 1; // comment with badActionPattern"));
+    try std.testing.expectEqualStrings("", stripComments("/// doc comment with badActionPattern"));
+    try std.testing.expectEqualStrings("", stripComments("//! module comment with badActionPattern"));
+    try std.testing.expectEqualStrings("const url = \"https://foo//bar\";", stripComments("const url = \"https://foo//bar\";"));
+    try std.testing.expectEqualStrings("    \\\\multiline // not stripped", stripComments("    \\\\multiline // not stripped"));
+    try std.testing.expectEqualStrings("const s = \\\\midline // not stripped", stripComments("const s = \\\\midline // not stripped"));
+    try std.testing.expectEqualStrings("const q = '\"'; ", stripComments("const q = '\"'; // comment with badActionPattern"));
+    try std.testing.expectEqualStrings("const q = '\\''; ", stripComments("const q = '\\''; // comment with badActionPattern"));
+    try std.testing.expectEqualStrings("const s = \"a\\\\\"; ", stripComments("const s = \"a\\\\\"; // comment with badActionPattern"));
+    try std.testing.expectEqualStrings(
+        "if (c == '\"') { const u = \"http://x\"; badActionPattern(); }",
+        stripComments("if (c == '\"') { const u = \"http://x\"; badActionPattern(); }"),
+    );
+    try std.testing.expectEqualStrings(
+        "const q = '\\\"'; const u = \"a//b\"; badActionPattern();",
+        stripComments("const q = '\\\"'; const u = \"a//b\"; badActionPattern();"),
+    );
+
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "comment_test.zig",
+        .data =
+        \\//! Discussion: badActionPattern is banned here
+        \\/// Note: explore.bfs( should not be called
+        \\pub fn ok() void {
+        \\    // inline comment with badActionPattern
+        \\    const url = "https://safe//call";
+        \\    const q = '"'; // comment with badActionPattern
+        \\    if (c == '"') { const u = "http://x"; realBadCall(); }
+        \\}
+        ,
+    });
+
+    const full_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "comment_test.zig" });
+    defer allocator.free(full_path);
+
+    var raw_violations: usize = 0;
+    try checkFile(io, allocator, full_path, &.{ "badActionPattern", "explore.bfs(", "realBadCall" }, false, &raw_violations, null, false);
+    try std.testing.expectEqual(@as(usize, 5), raw_violations);
+
+    var ignored_violations: usize = 0;
+    try checkFile(io, allocator, full_path, &.{ "badActionPattern", "explore.bfs(", "realBadCall" }, true, &ignored_violations, null, false);
+    // Comments were stripped; only the realBadCall inside code was flagged!
+    try std.testing.expectEqual(@as(usize, 1), ignored_violations);
 }
