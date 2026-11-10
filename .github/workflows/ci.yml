@@ -1,18 +1,33 @@
-name: ci
+name: CI
+
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      - name: fmt
+      - name: Format check
         run: zig fmt --check .
-      - name: test
+      - name: Run unit & suite tests
         run: zig build test
-      - name: examples
+      - name: Run examples
         run: zig build examples

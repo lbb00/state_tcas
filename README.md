@@ -1,5 +1,10 @@
 # state_tcas
 
+[![CI](https://github.com/lbb00/state_tcas/actions/workflows/ci.yml/badge.svg)](https://github.com/lbb00/state_tcas/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/lbb00/state_tcas)](https://github.com/lbb00/state_tcas/releases)
+[![Zig 0.17.0](https://img.shields.io/badge/zig-0.17.0-orange.svg)](https://ziglang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Bounded Safety and Liveness verification for Zig libraries under test.
 **Pure Zig `std` only** — zero third-party dependencies or external tools.
 
