@@ -121,12 +121,49 @@ pub fn build(b: *std.Build) void {
     const example_act_log = b.step("example-act-log", "Run examples/toy_act_log_dfs.zig");
     example_act_log.dependOn(&run_act_log.step);
 
+    const tla_ex = b.addExecutable(.{
+        .name = "toy_tla_lock",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/toy_tla_lock.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "state_tcas", .module = mod },
+            },
+        }),
+    });
+    const run_tla = b.addRunArtifact(tla_ex);
+    run_tla.setCwd(b.path("."));
+    const example_tla = b.step("example-tla-lock", "Run examples/toy_tla_lock.zig + TLA lock");
+    example_tla.dependOn(&run_tla.step);
+
+    const bootstrap_ex = b.addExecutable(.{
+        .name = "toy_bootstrap_dogfood",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/toy_bootstrap_dogfood.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "state_tcas", .module = mod },
+            },
+        }),
+    });
+    const run_bootstrap = b.addRunArtifact(bootstrap_ex);
+    run_bootstrap.setCwd(b.path("."));
+    const example_bootstrap = b.step("example-bootstrap", "Run examples/toy_bootstrap_dogfood.zig (self-verification)");
+    example_bootstrap.dependOn(&run_bootstrap.step);
+
+    const bootstrap_step = b.step("bootstrap", "Run self-bootstrapping dogfood verification");
+    bootstrap_step.dependOn(&run_bootstrap.step);
+
     const examples = b.step("examples", "Run all example-* executables");
     examples.dependOn(example_toy);
     examples.dependOn(example_exhaust);
     examples.dependOn(example_cal);
     examples.dependOn(example_cal_dfs);
     examples.dependOn(example_act_log);
+    examples.dependOn(example_tla);
+    examples.dependOn(example_bootstrap);
 }
 
 pub const GateRule = struct {

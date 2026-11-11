@@ -1,0 +1,23 @@
+{
+  "#meta": {
+    "format": "ITF",
+    "description": "Counterexample trace replayed in state_tcas"
+  },
+  "states": [
+    {
+      "#meta": { "index": 0 },
+      "action": "init",
+      "state": "idle"
+    },
+    {
+      "#meta": { "index": 1 },
+      "action": "propose",
+      "state": "preparing"
+    },
+    {
+      "#meta": { "index": 2 },
+      "action": "commit",
+      "state": "committed"
+    }
+  ]
+}

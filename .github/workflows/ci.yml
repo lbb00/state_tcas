@@ -29,5 +29,9 @@ jobs:
         run: zig fmt --check .
       - name: Run unit & suite tests
         run: zig build test
+      - name: Run gate check
+        run: zig build gate-check
+      - name: Run self-bootstrapping verification
+        run: zig build bootstrap
       - name: Run examples
         run: zig build examples

@@ -17,6 +17,7 @@ const trace_mod = @import("trace.zig");
 const calendar_mod = @import("calendar.zig");
 const monitor_mod = @import("monitor.zig");
 const explore_mod = @import("explore.zig");
+const tla_mod = @import("tla.zig");
 
 pub const picture = picture_mod;
 pub const exhaust = exhaust_mod;
@@ -25,6 +26,7 @@ pub const trace = trace_mod;
 pub const calendar = calendar_mod;
 pub const monitor = monitor_mod;
 pub const explore = explore_mod;
+pub const tla = tla_mod;
 
 pub const Picture = picture_mod.Picture;
 pub const Role = role_mod.Role;
@@ -41,5 +43,7 @@ test {
     _ = calendar_mod;
     _ = monitor_mod;
     _ = explore_mod;
+    _ = tla_mod;
     _ = @import("gate_check.zig");
+    _ = @import("bootstrap.zig");
 }
