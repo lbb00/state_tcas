@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Sectional / Block-Level Specification Locking (`st.tla`)**:
+  - `formatDeclarationSectionWithMarkers` / `formatDeclarationSection`: Format declaration blocks enclosed by section markers (`\* BEGIN DECLARATIONS` ... `\* END DECLARATIONS` or `\* BEGIN TRANSLATION` ... `\* END TRANSLATION`), allowing custom variables, initial state predicates, transition relations, and invariants to live alongside auto-generated constants and vocabularies within a single `.tla` specification file.
+  - `lockWithOptions`: Automatic detection and in-place updating of sectional blocks without overwriting user-authored formulas or module definitions outside the block, maintaining byte-level golden locks and CRLF normalization.
+- **Unverified Trace Variables Detection (`st.tla`)**:
+  - In `replayJsonTraceWithOptions`, detect custom state variables in JSON/ITF step objects that are not checked by scalar/enum projections, raising `error.TraceVariablesUnverified` to prevent false confidence when a trace specifies multi-variable state assertions.
+  - Added `allow_unverified_variables: bool = false` to `ReplayOptions` for explicit opt-in when unverified variables should be ignored.
+  - Added `error.TraceVariablesUnverified` to `TlaError` and whitelisted it in `isDisallowedRejectionError`.
+- **Pure-Zig Lightweight TLA+ Spec Syntax Validator (`st.tla`)**:
+  - `validateSpecSyntax`: In-process structural syntax validator for TLA+ modules without external Java, TLC, or SANY runtime dependencies. Validates module headers (`---- MODULE <Name> ----`), footers (`====`), balanced delimiters (`()`, `[]`, `{}`, `<<>>`), and unclosed strings/nested comments.
+- **Direct Action Coverage Verification (`st.picture`, `st.tla`)**:
+  - `Picture.verifyCoverage(Act)`: Verify that every defined variant of `Act` was exercised in recorded edges or sequence steps (`error.ActUncovered`).
+  - `ReplayStats.verifyCoverage(Act, pic)`: One-line coverage assertion on trace replay statistics.
+- **Apalache ADR-015 ITF Trace Export (`st.picture`)**:
+  - `Picture.renderItfJson`: Render recorded exploration steps as standard Apalache ADR-015 compliant Informal Trace Format (ITF) JSON traces, enabling seamless round-trip export and replay between `state_tcas` state space exploration and model checking workflows.
+
+### Fixed
+
+- **Allocation-Free `parseAct` for Zig 0.17 (`st.tla`)**:
+  - Refactored `parseAct` to use `std.meta.stringToEnum` for enum actions and inline inspection for void union variants without invoking heap allocators, resolving compatibility with Zig 0.17 std library.
+
 ## [0.3.0] - 2026-11-11
 
 ### Added

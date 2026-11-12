@@ -32,6 +32,8 @@ const Step = struct {
     note: []u8,
     from: []u8,
     to: []u8,
+    before: []u8,
+    after: []u8,
 };
 
 pub const Picture = struct {
@@ -53,6 +55,8 @@ pub const Picture = struct {
             allocator.free(step.note);
             allocator.free(step.from);
             allocator.free(step.to);
+            allocator.free(step.before);
+            allocator.free(step.after);
         }
         self.edges.deinit(allocator);
         self.steps.deinit(allocator);
@@ -93,7 +97,18 @@ pub const Picture = struct {
         errdefer allocator.free(from);
         const to = try allocator.dupe(u8, o.to);
         errdefer allocator.free(to);
-        try self.steps.append(allocator, .{ .label = label, .note = note, .from = from, .to = to });
+        const before = try allocator.dupe(u8, o.before);
+        errdefer allocator.free(before);
+        const after = try allocator.dupe(u8, o.after);
+        errdefer allocator.free(after);
+        try self.steps.append(allocator, .{
+            .label = label,
+            .note = note,
+            .from = from,
+            .to = to,
+            .before = before,
+            .after = after,
+        });
     }
 
     /// Every declared state must appear as an edge endpoint. Returns the first name that does not.
@@ -154,7 +169,118 @@ pub const Picture = struct {
         self.edges = from.edges;
         from.edges = .empty;
     }
+
+    /// Verify that every defined variant of `Act` was recorded in `Picture` edges or steps.
+    pub fn verifyCoverage(self: *const Picture, comptime Act: type) error{ActUncovered}!void {
+        const names = comptime switch (@typeInfo(Act)) {
+            .@"enum" => |e| e.field_names,
+            .@"union" => |u| u.field_names,
+            else => @compileError("Act must be enum or tagged union"),
+        };
+        inline for (names) |f_name| {
+            var covered = false;
+            for (self.edges.items) |edge| {
+                if (std.mem.eql(u8, edge.label, f_name)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                for (self.steps.items) |step| {
+                    if (std.mem.eql(u8, step.label, f_name)) {
+                        covered = true;
+                        break;
+                    }
+                }
+            }
+            if (!covered) return error.ActUncovered;
+        }
+    }
+
+    /// Export recorded transition steps as an Apalache ADR-015 compliant ITF JSON trace.
+    pub fn renderItfJson(self: *const Picture, allocator: std.mem.Allocator, options: RenderItfOptions) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        try out.appendSlice(allocator, "{\n  \"#meta\": {\n    \"format\": \"ITF\",\n");
+        try out.appendSlice(allocator, "    \"description\": ");
+        try appendJsonEscapedString(&out, allocator, options.description);
+        try out.appendSlice(allocator, ",\n    \"source\": ");
+        try appendJsonEscapedString(&out, allocator, options.source);
+        try out.appendSlice(allocator, "\n  },\n  \"vars\": [");
+        try appendJsonEscapedString(&out, allocator, options.state_var_name);
+        try out.appendSlice(allocator, "],\n  \"states\": [\n");
+
+        const steps = self.steps.items;
+        if (steps.len > 0) {
+            try out.appendSlice(allocator, "    {\n      \"#meta\": {\"index\": 0},\n");
+            if (options.include_actions) {
+                try out.appendSlice(allocator, "      \"action\": \"init\",\n");
+            }
+            try out.appendSlice(allocator, "      ");
+            try appendJsonEscapedString(&out, allocator, options.state_var_name);
+            try out.appendSlice(allocator, ": ");
+            try appendJsonEscapedString(&out, allocator, steps[0].before);
+            try out.appendSlice(allocator, "\n    }");
+
+            for (steps, 0..) |step, idx| {
+                try out.appendSlice(allocator, ",\n    {\n      \"#meta\": {\"index\": ");
+                var idx_buf: [32]u8 = undefined;
+                const idx_str = try std.fmt.bufPrint(&idx_buf, "{d}", .{idx + 1});
+                try out.appendSlice(allocator, idx_str);
+                try out.appendSlice(allocator, "},\n");
+
+                if (options.include_actions) {
+                    try out.appendSlice(allocator, "      \"action\": ");
+                    try appendJsonEscapedString(&out, allocator, step.label);
+                    try out.appendSlice(allocator, ",\n");
+                }
+
+                try out.appendSlice(allocator, "      ");
+                try appendJsonEscapedString(&out, allocator, options.state_var_name);
+                try out.appendSlice(allocator, ": ");
+                try appendJsonEscapedString(&out, allocator, step.after);
+                try out.appendSlice(allocator, "\n    }");
+            }
+            try out.appendSlice(allocator, "\n");
+        }
+
+        try out.appendSlice(allocator, "  ]\n}\n");
+        return out.toOwnedSlice(allocator);
+    }
 };
+
+pub const RenderItfOptions = struct {
+    description: []const u8 = "state_tcas counterexample trace",
+    source: []const u8 = "exploration",
+    state_var_name: []const u8 = "state",
+    include_actions: bool = true,
+};
+
+fn appendJsonEscapedString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, str: []const u8) !void {
+    try out.append(allocator, '"');
+    for (str) |c| {
+        switch (c) {
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            '\x08' => try out.appendSlice(allocator, "\\b"),
+            '\x0c' => try out.appendSlice(allocator, "\\f"),
+            else => {
+                if (c < 0x20) {
+                    var hex_buf: [8]u8 = undefined;
+                    const hex = try std.fmt.bufPrint(&hex_buf, "\\u00{x:0>2}", .{c});
+                    try out.appendSlice(allocator, hex);
+                } else {
+                    try out.append(allocator, c);
+                }
+            },
+        }
+    }
+    try out.append(allocator, '"');
+}
 
 fn edgeBefore(_: void, a: Edge, b: Edge) bool {
     const source = std.mem.order(u8, a.source, b.source);
@@ -351,4 +477,94 @@ test "lock normalizes CRLF on-disk content to LF expected and succeeds without m
     // Non-matching content still returns PictureDrift
     try tmp.dir.writeFile(io, .{ .sub_path = "diagram.md", .data = "different\r\ncontent\r\n" });
     try std.testing.expectError(error.PictureDrift, lock(io, allocator, full_path, lf_expected));
+}
+
+test "Picture.verifyCoverage detects covered and uncovered actions" {
+    const allocator = std.testing.allocator;
+    const Act = enum { start, stop, pause };
+
+    var pic = Picture{};
+    defer pic.deinit(allocator);
+
+    try pic.observe(allocator, .{
+        .before = "idle",
+        .after = "running",
+        .label = "start",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+
+    // 'stop' and 'pause' are not yet covered
+    try std.testing.expectError(error.ActUncovered, pic.verifyCoverage(Act));
+
+    try pic.observe(allocator, .{
+        .before = "running",
+        .after = "paused",
+        .label = "pause",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+
+    try std.testing.expectError(error.ActUncovered, pic.verifyCoverage(Act));
+
+    try pic.observe(allocator, .{
+        .before = "paused",
+        .after = "idle",
+        .label = "stop",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+
+    // All actions now covered
+    try pic.verifyCoverage(Act);
+}
+
+test "Picture.renderItfJson exports valid Apalache ADR-015 compliant ITF trace" {
+    const allocator = std.testing.allocator;
+    var pic = Picture{};
+    defer pic.deinit(allocator);
+
+    try pic.observe(allocator, .{
+        .before = "init_st",
+        .after = "mid_st",
+        .label = "step1",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+    try pic.observe(allocator, .{
+        .before = "mid_st",
+        .after = "final_st",
+        .label = "step2",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+
+    const itf = try pic.renderItfJson(allocator, .{
+        .description = "test trace",
+        .source = "test",
+        .state_var_name = "state",
+        .include_actions = true,
+    });
+    defer allocator.free(itf);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, itf, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .object);
+    const obj = parsed.value.object;
+    try std.testing.expect(obj.get("#meta") != null);
+    try std.testing.expect(obj.get("vars") != null);
+    const states = obj.get("states").?.array;
+    try std.testing.expectEqual(@as(usize, 3), states.items.len);
+    try std.testing.expectEqualStrings("init", states.items[0].object.get("action").?.string);
+    try std.testing.expectEqualStrings("init_st", states.items[0].object.get("state").?.string);
+    try std.testing.expectEqualStrings("step1", states.items[1].object.get("action").?.string);
+    try std.testing.expectEqualStrings("mid_st", states.items[1].object.get("state").?.string);
+    try std.testing.expectEqualStrings("step2", states.items[2].object.get("action").?.string);
+    try std.testing.expectEqualStrings("final_st", states.items[2].object.get("state").?.string);
 }

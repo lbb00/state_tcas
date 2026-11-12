@@ -43,8 +43,8 @@ Following Semantic Versioning, `0.x` provides a stable core module layout. Any c
 | `exhaust` | `orders`, `play`, `publish`, `render`, `Shell`, `fact`, `SkipOrder`, `verify*` |
 | `calendar` | `Calendar`, `Timed`, `EventId`, `ClockRewind`, `clone`, `resetTo` |
 | `monitor` | `Safety`, `Liveness`, `Bundle`, `Monitored`, `MonitoredKeyed`, `KeyedOnly` |
-| `picture` | `Picture`, `Observation`, `lock`, `matchesNormalizingCRLF` |
-| `tla` | `formatDeclarations`, `lock`, `parseAct`, `replayJsonTrace`, `decodeItfValue`, `verifyCoverage`, `TlaError`, `ReplayStats` |
+| `picture` | `Picture`, `Observation`, `lock`, `matchesNormalizingCRLF`, `renderItfJson`, `verifyCoverage`, `RenderItfOptions` |
+| `tla` | `formatDeclarations`, `formatDeclarationSection`, `lock`, `lockWithOptions`, `parseAct`, `replayJsonTrace`, `replayJsonTraceWithOptions`, `validateSpecSyntax`, `decodeItfValue`, `verifyCoverage`, `TlaError`, `ReplayStats` |
 | `role` / `trace` | Module re-exports |
 | `build.zig` | `addExploreGateCheck`, `GateRule`, `ExploreGateOptions` |
 
