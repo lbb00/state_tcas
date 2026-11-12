@@ -1944,12 +1944,11 @@ pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8
                     cursor += 7;
                     while (cursor < spec_content.len and (spec_content[cursor] == ' ' or spec_content[cursor] == '\t')) : (cursor += 1) {}
                     const id_start = cursor;
-                    while (cursor < spec_content.len and (
-                        (spec_content[cursor] >= 'a' and spec_content[cursor] <= 'z') or
+                    while (cursor < spec_content.len and ((spec_content[cursor] >= 'a' and spec_content[cursor] <= 'z') or
                         (spec_content[cursor] >= 'A' and spec_content[cursor] <= 'Z') or
                         (spec_content[cursor] >= '0' and spec_content[cursor] <= '9') or
-                        spec_content[cursor] == '_'
-                    )) : (cursor += 1) {}
+                        spec_content[cursor] == '_')) : (cursor += 1)
+                    {}
                     const mod_name = spec_content[id_start..cursor];
                     if (mod_name.len == 0 or !isValidTlaIdentifier(mod_name)) {
                         return error.InvalidTlaIdentifier;
