@@ -34,6 +34,7 @@ const Step = struct {
     to: []u8,
     before: []u8,
     after: []u8,
+    rejected: bool = false,
 };
 
 pub const Picture = struct {
@@ -108,6 +109,7 @@ pub const Picture = struct {
             .to = to,
             .before = before,
             .after = after,
+            .rejected = o.rejected,
         });
     }
 
@@ -170,7 +172,16 @@ pub const Picture = struct {
         from.edges = .empty;
     }
 
-    /// Verify that every defined variant of `Act` was recorded in `Picture` edges or steps.
+    fn matchActionLabel(label: []const u8, action_name: []const u8) bool {
+        if (std.mem.eql(u8, label, action_name)) return true;
+        if (std.mem.startsWith(u8, label, action_name) and label.len > action_name.len) {
+            const sep = label[action_name.len];
+            return sep == '(' or sep == '{' or sep == ':' or sep == ' ';
+        }
+        return false;
+    }
+
+    /// Verify that every defined variant of `Act` was recorded in non-rejected steps or edges.
     pub fn verifyCoverage(self: *const Picture, comptime Act: type) error{ActUncovered}!void {
         const names = comptime switch (@typeInfo(Act)) {
             .@"enum" => |e| e.field_names,
@@ -180,14 +191,15 @@ pub const Picture = struct {
         inline for (names) |f_name| {
             var covered = false;
             for (self.edges.items) |edge| {
-                if (std.mem.eql(u8, edge.label, f_name)) {
+                if (matchActionLabel(edge.label, f_name)) {
                     covered = true;
                     break;
                 }
             }
             if (!covered) {
                 for (self.steps.items) |step| {
-                    if (std.mem.eql(u8, step.label, f_name)) {
+                    if (step.rejected) continue;
+                    if (matchActionLabel(step.label, f_name)) {
                         covered = true;
                         break;
                     }
@@ -199,6 +211,24 @@ pub const Picture = struct {
 
     /// Export recorded transition steps as an Apalache ADR-015 compliant ITF JSON trace.
     pub fn renderItfJson(self: *const Picture, allocator: std.mem.Allocator, options: RenderItfOptions) ![]u8 {
+        var valid_step_count: usize = 0;
+        for (self.steps.items) |step| {
+            if (!step.rejected) valid_step_count += 1;
+        }
+        if (valid_step_count == 0) return error.EmptyTrace;
+
+        // Check continuity across consecutive non-rejected steps
+        var prev_after: ?[]const u8 = null;
+        for (self.steps.items) |step| {
+            if (step.rejected) continue;
+            if (prev_after) |pa| {
+                if (!std.mem.eql(u8, step.before, pa)) {
+                    return error.DiscontinuousTrace;
+                }
+            }
+            prev_after = step.after;
+        }
+
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
 
@@ -209,43 +239,56 @@ pub const Picture = struct {
         try appendJsonEscapedString(&out, allocator, options.source);
         try out.appendSlice(allocator, "\n  },\n  \"vars\": [");
         try appendJsonEscapedString(&out, allocator, options.state_var_name);
+        if (options.include_actions) {
+            try out.appendSlice(allocator, ", \"mbt::actionTaken\"");
+        }
         try out.appendSlice(allocator, "],\n  \"states\": [\n");
 
-        const steps = self.steps.items;
-        if (steps.len > 0) {
-            try out.appendSlice(allocator, "    {\n      \"#meta\": {\"index\": 0},\n");
-            if (options.include_actions) {
-                try out.appendSlice(allocator, "      \"action\": \"init\",\n");
+        var first_step: ?Step = null;
+        for (self.steps.items) |step| {
+            if (!step.rejected) {
+                first_step = step;
+                break;
             }
+        }
+
+        try out.appendSlice(allocator, "    {\n      \"#meta\": {\"index\": 0},\n");
+        if (options.include_actions) {
+            try out.appendSlice(allocator, "      \"action\": \"init\",\n");
+            try out.appendSlice(allocator, "      \"mbt::actionTaken\": \"init\",\n");
+        }
+        try out.appendSlice(allocator, "      ");
+        try appendJsonEscapedString(&out, allocator, options.state_var_name);
+        try out.appendSlice(allocator, ": ");
+        try appendJsonEscapedString(&out, allocator, first_step.?.before);
+        try out.appendSlice(allocator, "\n    }");
+
+        var state_idx: usize = 0;
+        for (self.steps.items) |step| {
+            if (step.rejected) continue;
+            state_idx += 1;
+            try out.appendSlice(allocator, ",\n    {\n      \"#meta\": {\"index\": ");
+            var idx_buf: [32]u8 = undefined;
+            const idx_str = try std.fmt.bufPrint(&idx_buf, "{d}", .{state_idx});
+            try out.appendSlice(allocator, idx_str);
+            try out.appendSlice(allocator, "},\n");
+
+            if (options.include_actions) {
+                try out.appendSlice(allocator, "      \"action\": ");
+                try appendJsonEscapedString(&out, allocator, step.label);
+                try out.appendSlice(allocator, ",\n");
+                try out.appendSlice(allocator, "      \"mbt::actionTaken\": ");
+                try appendJsonEscapedString(&out, allocator, step.label);
+                try out.appendSlice(allocator, ",\n");
+            }
+
             try out.appendSlice(allocator, "      ");
             try appendJsonEscapedString(&out, allocator, options.state_var_name);
             try out.appendSlice(allocator, ": ");
-            try appendJsonEscapedString(&out, allocator, steps[0].before);
+            try appendJsonEscapedString(&out, allocator, step.after);
             try out.appendSlice(allocator, "\n    }");
-
-            for (steps, 0..) |step, idx| {
-                try out.appendSlice(allocator, ",\n    {\n      \"#meta\": {\"index\": ");
-                var idx_buf: [32]u8 = undefined;
-                const idx_str = try std.fmt.bufPrint(&idx_buf, "{d}", .{idx + 1});
-                try out.appendSlice(allocator, idx_str);
-                try out.appendSlice(allocator, "},\n");
-
-                if (options.include_actions) {
-                    try out.appendSlice(allocator, "      \"action\": ");
-                    try appendJsonEscapedString(&out, allocator, step.label);
-                    try out.appendSlice(allocator, ",\n");
-                }
-
-                try out.appendSlice(allocator, "      ");
-                try appendJsonEscapedString(&out, allocator, options.state_var_name);
-                try out.appendSlice(allocator, ": ");
-                try appendJsonEscapedString(&out, allocator, step.after);
-                try out.appendSlice(allocator, "\n    }");
-            }
-            try out.appendSlice(allocator, "\n");
         }
-
-        try out.appendSlice(allocator, "  ]\n}\n");
+        try out.appendSlice(allocator, "\n  ]\n}\n");
         return out.toOwnedSlice(allocator);
     }
 };
@@ -258,6 +301,7 @@ pub const RenderItfOptions = struct {
 };
 
 fn appendJsonEscapedString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, str: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(str)) return error.InvalidUtf8;
     try out.append(allocator, '"');
     for (str) |c| {
         switch (c) {
@@ -270,9 +314,9 @@ fn appendJsonEscapedString(out: *std.ArrayList(u8), allocator: std.mem.Allocator
             '\x0c' => try out.appendSlice(allocator, "\\f"),
             else => {
                 if (c < 0x20) {
-                    var hex_buf: [8]u8 = undefined;
-                    const hex = try std.fmt.bufPrint(&hex_buf, "\\u00{x:0>2}", .{c});
-                    try out.appendSlice(allocator, hex);
+                    var esc_buf: [7]u8 = undefined;
+                    const esc_str = try std.fmt.bufPrint(&esc_buf, "\\u00{x:0>2}", .{c});
+                    try out.appendSlice(allocator, esc_str);
                 } else {
                     try out.append(allocator, c);
                 }
@@ -567,4 +611,114 @@ test "Picture.renderItfJson exports valid Apalache ADR-015 compliant ITF trace" 
     try std.testing.expectEqualStrings("mid_st", states.items[1].object.get("state").?.string);
     try std.testing.expectEqualStrings("step2", states.items[2].object.get("action").?.string);
     try std.testing.expectEqualStrings("final_st", states.items[2].object.get("state").?.string);
+}
+
+test "Picture.verifyCoverage skips rejected steps and matches tagged unions" {
+    const allocator = std.testing.allocator;
+    const Act = union(enum) {
+        push: u32,
+        pop: void,
+    };
+
+    var pic = Picture{};
+    defer pic.deinit(allocator);
+
+    // Rejected step does not count as coverage
+    try pic.observe(allocator, .{
+        .before = "empty",
+        .after = "empty",
+        .label = "push(42)",
+        .rejected = true,
+        .mutated = false,
+        .note = "rejected",
+    });
+    try std.testing.expectError(error.ActUncovered, pic.verifyCoverage(Act));
+
+    // Successful step matching tagged union variant prefix
+    try pic.observe(allocator, .{
+        .before = "empty",
+        .after = "loaded",
+        .label = "push(42)",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+    // pop is still uncovered
+    try std.testing.expectError(error.ActUncovered, pic.verifyCoverage(Act));
+
+    try pic.observe(allocator, .{
+        .before = "loaded",
+        .after = "empty",
+        .label = "pop",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+    try pic.verifyCoverage(Act);
+}
+
+test "Picture.renderItfJson rejects discontinuous or empty traces and skips rejections" {
+    const allocator = std.testing.allocator;
+    var pic = Picture{};
+    defer pic.deinit(allocator);
+
+    // Empty picture rejects ITF export
+    try std.testing.expectError(error.EmptyTrace, pic.renderItfJson(allocator, .{}));
+
+    // Only rejected steps also yields empty trace
+    try pic.observe(allocator, .{
+        .before = "idle",
+        .after = "idle",
+        .label = "noop",
+        .rejected = true,
+        .mutated = false,
+        .note = "",
+    });
+    try std.testing.expectError(error.EmptyTrace, pic.renderItfJson(allocator, .{}));
+
+    // Add continuous valid steps with an interleaved rejected step
+    try pic.observe(allocator, .{
+        .before = "s0",
+        .after = "s1",
+        .label = "step1",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+    try pic.observe(allocator, .{
+        .before = "s1",
+        .after = "s1",
+        .label = "bad_step",
+        .rejected = true,
+        .mutated = false,
+        .note = "",
+    });
+    try pic.observe(allocator, .{
+        .before = "s1",
+        .after = "s2",
+        .label = "step2",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+
+    const itf = try pic.renderItfJson(allocator, .{});
+    defer allocator.free(itf);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, itf, .{});
+    defer parsed.deinit();
+    const states = parsed.value.object.get("states").?.array;
+    // index 0 (s0), index 1 (s1 from step1), index 2 (s2 from step2), bad_step skipped
+    try std.testing.expectEqual(@as(usize, 3), states.items.len);
+
+    // Now append a discontinuous step
+    try pic.observe(allocator, .{
+        .before = "s_other",
+        .after = "s3",
+        .label = "step3",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+    try std.testing.expectError(error.DiscontinuousTrace, pic.renderItfJson(allocator, .{}));
 }
