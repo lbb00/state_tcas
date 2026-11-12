@@ -470,11 +470,6 @@ pub fn lockWithOptions(
         {
             detected_begin = "\\* BEGIN DECLARATIONS";
             detected_end = "\\* END DECLARATIONS";
-        } else if (std.mem.indexOf(u8, actual, "\\* BEGIN TRANSLATION") != null and
-            std.mem.indexOf(u8, actual, "\\* END TRANSLATION") != null)
-        {
-            detected_begin = "\\* BEGIN TRANSLATION";
-            detected_end = "\\* END TRANSLATION";
         }
     }
 
@@ -1957,6 +1952,35 @@ pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8
                     const dash_end_start = cursor;
                     while (cursor < spec_content.len and spec_content[cursor] == '-') : (cursor += 1) {}
                     if (cursor - dash_end_start >= 4) {
+                        var valid_header_line = true;
+                        while (cursor < spec_content.len and spec_content[cursor] != '\n') {
+                            const hc = spec_content[cursor];
+                            if (hc == ' ' or hc == '\t' or hc == '\r') {
+                                cursor += 1;
+                            } else if (cursor + 1 < spec_content.len and hc == '\\' and spec_content[cursor + 1] == '*') {
+                                while (cursor < spec_content.len and spec_content[cursor] != '\n') : (cursor += 1) {}
+                                break;
+                            } else if (cursor + 1 < spec_content.len and hc == '(' and spec_content[cursor + 1] == '*') {
+                                cursor += 2;
+                                var b_depth: usize = 1;
+                                while (cursor < spec_content.len and b_depth > 0) {
+                                    if (cursor + 1 < spec_content.len and spec_content[cursor] == '(' and spec_content[cursor + 1] == '*') {
+                                        b_depth += 1;
+                                        cursor += 2;
+                                    } else if (cursor + 1 < spec_content.len and spec_content[cursor] == '*' and spec_content[cursor + 1] == ')') {
+                                        b_depth -= 1;
+                                        cursor += 2;
+                                    } else {
+                                        cursor += 1;
+                                    }
+                                }
+                                if (b_depth > 0) return error.UnclosedComment;
+                            } else {
+                                valid_header_line = false;
+                                break;
+                            }
+                        }
+                        if (!valid_header_line) return error.MissingModuleHeader;
                         found_header = true;
                         continue;
                     }
@@ -1970,8 +1994,38 @@ pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8
             const eq_start = cursor;
             while (cursor < spec_content.len and spec_content[cursor] == '=') : (cursor += 1) {}
             if (cursor - eq_start >= 4) {
-                found_footer = true;
-                continue;
+                var valid_footer_line = true;
+                while (cursor < spec_content.len and spec_content[cursor] != '\n') {
+                    const fc = spec_content[cursor];
+                    if (fc == ' ' or fc == '\t' or fc == '\r') {
+                        cursor += 1;
+                    } else if (cursor + 1 < spec_content.len and fc == '\\' and spec_content[cursor + 1] == '*') {
+                        while (cursor < spec_content.len and spec_content[cursor] != '\n') : (cursor += 1) {}
+                        break;
+                    } else if (cursor + 1 < spec_content.len and fc == '(' and spec_content[cursor + 1] == '*') {
+                        cursor += 2;
+                        var b_depth: usize = 1;
+                        while (cursor < spec_content.len and b_depth > 0) {
+                            if (cursor + 1 < spec_content.len and spec_content[cursor] == '(' and spec_content[cursor + 1] == '*') {
+                                b_depth += 1;
+                                cursor += 2;
+                            } else if (cursor + 1 < spec_content.len and spec_content[cursor] == '*' and spec_content[cursor + 1] == ')') {
+                                b_depth -= 1;
+                                cursor += 2;
+                            } else {
+                                cursor += 1;
+                            }
+                        }
+                        if (b_depth > 0) return error.UnclosedComment;
+                    } else {
+                        valid_footer_line = false;
+                        break;
+                    }
+                }
+                if (valid_footer_line) {
+                    found_footer = true;
+                    continue;
+                }
             }
             continue;
         }
@@ -3512,7 +3566,7 @@ test "lockWithOptions supports sectional declaration locking and in-place update
         .allow_update = false,
     });
 
-    // 5. Test with standard PlusCal translation markers (\* BEGIN TRANSLATION ... \* END TRANSLATION)
+    // 5. Test with explicit custom section markers (e.g. PlusCal translation markers)
     const translation_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path, "TranslationModel.tla" });
     defer alloc.free(translation_path);
 
@@ -3539,8 +3593,19 @@ test "lockWithOptions supports sectional declaration locking and in-place update
         \\
     ;
     try tmp.dir.writeFile(io, .{ .sub_path = "TranslationModel.tla", .data = translation_spec });
+
+    // Without explicit section option, auto-detection targets only BEGIN DECLARATIONS (protecting PlusCal blocks)
+    try std.testing.expectError(error.TlaDrift, lockWithOptions(io, alloc, translation_path, "TranslationModel", Act, State, null, .{
+        .allow_update = false,
+    }));
+
+    // With explicit section markers, custom translation blocks are verified
     try lockWithOptions(io, alloc, translation_path, "TranslationModel", Act, State, null, .{
         .allow_update = false,
+        .section = .{
+            .begin_marker = "\\* BEGIN TRANSLATION",
+            .end_marker = "\\* END TRANSLATION",
+        },
     });
 }
 
@@ -3649,6 +3714,14 @@ test "validateSpecSyntax verifies balanced delimiters, headers, footers, and com
         \\*)
     ;
     try std.testing.expectError(error.MissingModuleFooter, validateSpecSyntax(alloc, fake_footer_in_comment));
+
+    // 14. Stray non-comment junk on header line is rejected
+    const header_with_junk = "---- MODULE Foo ---- junk\n====\n";
+    try std.testing.expectError(error.MissingModuleHeader, validateSpecSyntax(alloc, header_with_junk));
+
+    // 15. Header with valid comments is accepted
+    const header_with_comment = "---- MODULE Foo ---- \\* header comment\n====\n";
+    try validateSpecSyntax(alloc, header_with_comment);
 }
 
 test "replayJsonTrace accepts trace serializer toJson event fields with scalar projection" {
