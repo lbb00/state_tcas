@@ -1084,6 +1084,63 @@ pub fn deepEql(comptime T: type, a: T, b: T) bool {
     }
 }
 
+pub fn deepClone(comptime T: type, allocator: std.mem.Allocator, val: T) anyerror!T {
+    switch (@typeInfo(T)) {
+        .pointer => |p| switch (p.size) {
+            .slice => {
+                const copy = try allocator.alloc(p.child, val.len);
+                for (val, 0..) |elem, idx| {
+                    copy[idx] = try deepClone(p.child, allocator, elem);
+                }
+                return copy;
+            },
+            .one => {
+                switch (@typeInfo(p.child)) {
+                    .@"opaque", .@"fn" => return val,
+                    else => {
+                        const copy = try allocator.create(p.child);
+                        copy.* = try deepClone(p.child, allocator, val.*);
+                        return copy;
+                    },
+                }
+            },
+            else => return val,
+        },
+        .@"struct" => |s| {
+            var copy: T = undefined;
+            inline for (s.field_names) |f_name| {
+                @field(copy, f_name) = try deepClone(@TypeOf(@field(val, f_name)), allocator, @field(val, f_name));
+            }
+            return copy;
+        },
+        .optional => {
+            if (val) |v| {
+                return try deepClone(@typeInfo(T).optional.child, allocator, v);
+            }
+            return null;
+        },
+        .array => {
+            var copy: T = undefined;
+            for (val, 0..) |elem, idx| {
+                copy[idx] = try deepClone(@TypeOf(elem), allocator, elem);
+            }
+            return copy;
+        },
+        .@"union" => |u| {
+            const tag = std.meta.activeTag(val);
+            inline for (u.field_names, u.field_types) |f_name, f_type| {
+                if (std.mem.eql(u8, f_name, @tagName(tag))) {
+                    if (f_type == void) return @unionInit(T, f_name, {});
+                    const inner = try deepClone(f_type, allocator, @field(val, f_name));
+                    return @unionInit(T, f_name, inner);
+                }
+            }
+            return val;
+        },
+        else => return val,
+    }
+}
+
 pub const ReplayOptions = struct {
     /// Expected rejection specification for negative counterexample regression testing.
     /// When specified, replay expects a failure at `at_step` with `err`.
@@ -1336,6 +1393,19 @@ pub const StepOutcome = union(enum) {
     state_diverged: anyerror,
 };
 
+fn hasAnyStateField(comptime Proj: type, state_var_name: []const u8) bool {
+    if (@typeInfo(Proj) != .@"struct") return false;
+    const s = @typeInfo(Proj).@"struct";
+    inline for (s.field_names) |f_name| {
+        if (std.mem.eql(u8, f_name, state_var_name) or
+            comptime (std.mem.eql(u8, f_name, "state") or std.mem.eql(u8, f_name, "after")))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn StructExpectation(comptime S: type) type {
     const s_info = @typeInfo(S).@"struct";
     return struct {
@@ -1353,6 +1423,7 @@ fn StepPlan(comptime Act: type, comptime ProjType: type) type {
         expected_scalar_state: ?[]const u8 = null,
         expected_before: ?[]const u8 = null,
         expected_rejected: ?bool = null,
+        state_field_idx: ?usize = null,
         struct_expectation: if (is_struct_proj) StructExpectation(ProjType) else void =
             if (is_struct_proj) .{} else {},
     };
@@ -1447,7 +1518,7 @@ fn ingestStepPlan(
                     exp_state_name = v.string;
                 } else if (!is_struct_proj) {
                     return error.InvalidTraceFormat;
-                } else if (!@hasField(ProjType, "state") and !@hasField(ProjType, "after")) {
+                } else if (!hasAnyStateField(ProjType, options.state_var_name)) {
                     return error.ProjectionUnavailable;
                 }
             }
@@ -1460,7 +1531,7 @@ fn ingestStepPlan(
                     exp_state_name = v.string;
                 } else if (!is_struct_proj) {
                     return error.InvalidTraceFormat;
-                } else if (!@hasField(ProjType, "after") and !@hasField(ProjType, "state")) {
+                } else if (!hasAnyStateField(ProjType, options.state_var_name)) {
                     return error.ProjectionUnavailable;
                 }
             }
@@ -1599,8 +1670,6 @@ fn ingestStepPlan(
         if (is_struct_proj) {
             if (item != .object) return error.InvalidTraceFormat;
             const s = @typeInfo(ProjType).@"struct";
-            var matched_exp_state = false;
-
             var state_field_idx: ?usize = null;
             inline for (s.field_names, 0..) |sf_name, idx| {
                 if (std.mem.eql(u8, sf_name, options.state_var_name)) {
@@ -1624,7 +1693,9 @@ fn ingestStepPlan(
                     }
                 }
             }
+            plan.state_field_idx = state_field_idx;
 
+            var matched_exp_state = false;
             inline for (s.field_names, s.field_types, 0..) |sf_name, sf_type, idx| {
                 const is_primary_state = (state_field_idx != null and state_field_idx.? == idx);
                 const maybe_exp_v = if (item.object.get(sf_name)) |v|
@@ -1660,12 +1731,12 @@ fn ingestStepPlan(
                         plan.struct_expectation.string_alias_field_idx = idx;
                         matched_exp_state = true;
                     } else {
-                        if (@typeInfo(sf_type) != .optional) {
+                        if (@typeInfo(sf_type) != .optional and !(exp_rejected != null and exp_rejected.? == true and !has_state_assertion)) {
                             return error.ProjectionFieldMissing;
                         }
                     }
                 } else {
-                    if (@typeInfo(sf_type) != .optional) {
+                    if (@typeInfo(sf_type) != .optional and !(exp_rejected != null and exp_rejected.? == true and !has_state_assertion)) {
                         return error.ProjectionFieldMissing;
                     }
                 }
@@ -1773,12 +1844,13 @@ fn executeStepPlan(
     pic: ?*picture.Picture,
     stats: *ReplayStats,
     options: ReplayOptions,
-) StepOutcome {
+    arena_allocator: std.mem.Allocator,
+) anyerror!StepOutcome {
     const CtxType = Unwrap(@TypeOf(ctx));
     const has_enabled = @hasDecl(CtxType, "enabled");
     const has_project = @hasDecl(CtxType, "project");
     const is_struct_proj = (has_project and comptime @typeInfo(ProjType) == .@"struct");
-    const pre_st = if (has_project) ctx.project() else {};
+    const pre_st = if (has_project) (try deepClone(ProjType, arena_allocator, ctx.project())) else {};
 
     // Pre-transition state projection verification
     if (plan.expected_before) |exp_before| {
@@ -1787,22 +1859,42 @@ fn executeStepPlan(
             if (comptime is_struct_proj) {
                 const s = @typeInfo(ProjType).@"struct";
                 var matched = false;
-                inline for (s.field_names) |f_name| {
-                    if (std.mem.eql(u8, f_name, options.state_var_name) or
-                        comptime (std.mem.eql(u8, f_name, "state") or std.mem.eql(u8, f_name, "after")))
-                    {
-                        const sub_val = @field(cur_st, f_name);
-                        const sub_val_str: ?[]const u8 = switch (@typeInfo(@TypeOf(sub_val))) {
-                            .@"enum" => @tagName(sub_val),
-                            .pointer => |p| if (p.size == .slice and p.child == u8) sub_val else null,
-                            else => null,
-                        };
-                        if (sub_val_str) |s_str| {
-                            if (!std.mem.eql(u8, s_str, exp_before)) {
-                                return .{ .state_diverged = error.TraceDiverged };
+                if (plan.state_field_idx) |s_idx| {
+                    inline for (s.field_names, 0..) |f_name, idx| {
+                        if (idx == s_idx) {
+                            const sub_val = @field(cur_st, f_name);
+                            const sub_val_str: ?[]const u8 = switch (@typeInfo(@TypeOf(sub_val))) {
+                                .@"enum" => @tagName(sub_val),
+                                .pointer => |p| if (p.size == .slice and p.child == u8) sub_val else null,
+                                else => null,
+                            };
+                            if (sub_val_str) |s_str| {
+                                if (!std.mem.eql(u8, s_str, exp_before)) {
+                                    return .{ .state_diverged = error.TraceDiverged };
+                                }
+                                matched = true;
+                                break;
                             }
-                            matched = true;
-                            break;
+                        }
+                    }
+                } else {
+                    inline for (s.field_names) |f_name| {
+                        if (std.mem.eql(u8, f_name, options.state_var_name) or
+                            comptime (std.mem.eql(u8, f_name, "state") or std.mem.eql(u8, f_name, "after")))
+                        {
+                            const sub_val = @field(cur_st, f_name);
+                            const sub_val_str: ?[]const u8 = switch (@typeInfo(@TypeOf(sub_val))) {
+                                .@"enum" => @tagName(sub_val),
+                                .pointer => |p| if (p.size == .slice and p.child == u8) sub_val else null,
+                                else => null,
+                            };
+                            if (sub_val_str) |s_str| {
+                                if (!std.mem.eql(u8, s_str, exp_before)) {
+                                    return .{ .state_diverged = error.TraceDiverged };
+                                }
+                                matched = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1862,6 +1954,9 @@ fn executeStepPlan(
 
         // 2. Dispatch step
         dispatchStep(ctx, act, pic) catch |err| {
+            if (isDisallowedRejectionError(err)) {
+                return .{ .action_rejected = err };
+            }
             if (plan.expected_rejected != null and plan.expected_rejected.? == true) {
                 if (has_project) {
                     const cur_st = ctx.project();
@@ -1950,18 +2045,7 @@ pub fn replayJsonTraceWithOptions(
     pic: ?*picture.Picture,
     options: ReplayOptions,
 ) !ReplayStats {
-    if (options.state_var_name.len == 0 or
-        std.mem.eql(u8, options.state_var_name, "action") or
-        std.mem.eql(u8, options.state_var_name, "actionTaken") or
-        std.mem.eql(u8, options.state_var_name, "mbt::actionTaken") or
-        std.mem.eql(u8, options.state_var_name, "payload") or
-        std.mem.eql(u8, options.state_var_name, "mbt::nondetPicks") or
-        std.mem.eql(u8, options.state_var_name, "before") or
-        std.mem.eql(u8, options.state_var_name, "rejected") or
-        std.mem.eql(u8, options.state_var_name, "#meta"))
-    {
-        return error.InvalidStateVariableName;
-    }
+    try picture.validateStateVarName(options.state_var_name);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
@@ -1996,7 +2080,7 @@ pub fn replayJsonTraceWithOptions(
 
     for (items, 0..) |item, step_index| {
         const plan = try ingestStepPlan(Act, ProjType, ctx, item, step_index, trace_info, options, arena_allocator);
-        const outcome = executeStepPlan(Act, ProjType, ctx, plan, pic, &stats, options);
+        const outcome = try executeStepPlan(Act, ProjType, ctx, plan, pic, &stats, options, arena_allocator);
         switch (outcome) {
             .success => {
                 if (plan.expected_rejected != null and plan.expected_rejected.? == true) {
@@ -4686,4 +4770,133 @@ test "Picture.renderItfJson round-trips through replayJsonTrace" {
     try std.testing.expectEqual(@as(usize, 4), stats.states_verified);
     try std.testing.expectEqual(State.s3, h.st);
     try std.testing.expectEqual(@as(u32, 52), h.val);
+}
+
+test "replayJsonTrace detects in-place mutation of slice projection during rejected step" {
+    const Act = enum { mutate_slice };
+    const Proj = struct {
+        items: []const u32,
+    };
+
+    const Harness = struct {
+        buf: [2]u32 = .{ 10, 20 },
+        pub fn step(self: *@This(), act: Act) !void {
+            switch (act) {
+                .mutate_slice => {
+                    self.buf[0] = 999;
+                    return error.FailedAfterInPlaceMutation;
+                },
+            }
+        }
+        pub fn project(self: *const @This()) Proj {
+            return .{ .items = &self.buf };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const trace =
+        \\[{"action": "mutate_slice", "rejected": true}]
+    ;
+    var h = Harness{};
+    // Even though project returns a slice pointer, deepClone snapshot detects in-place element mutation
+    try std.testing.expectError(error.RejectedButMutated, replayJsonTrace(Act, &h, alloc, trace, null));
+}
+
+test "replayJsonTrace verifies enabled guard rejection branch and detects divergence" {
+    const Act = enum { allowed, blocked };
+    const State = enum { s0, s1 };
+
+    const Harness = struct {
+        st: State = .s0,
+        pub fn enabled(self: *const @This()) []const Act {
+            _ = self;
+            return &.{.allowed};
+        }
+        pub fn step(self: *@This(), act: Act) !void {
+            switch (act) {
+                .allowed => self.st = .s1,
+                .blocked => unreachable,
+            }
+        }
+        pub fn project(self: *const @This()) State {
+            return self.st;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+
+    // 1. Blocked action rejected by guard cleanly succeeds when after matches
+    const good_trace =
+        \\[{"action": "blocked", "rejected": true, "after": "s0"}]
+    ;
+    var h1 = Harness{};
+    const stats = try replayJsonTrace(Act, &h1, alloc, good_trace, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.steps);
+
+    // 2. Blocked action rejected by guard fails when after diverges
+    const bad_trace =
+        \\[{"action": "blocked", "rejected": true, "after": "s1"}]
+    ;
+    var h2 = Harness{};
+    try std.testing.expectError(error.TraceDiverged, replayJsonTrace(Act, &h2, alloc, bad_trace, null));
+}
+
+test "struct projection prioritizes custom state_var_name for before assertion" {
+    const Act = enum { step_fwd };
+    const Phase = enum { idle, working };
+    const Proj = struct {
+        state: u32,
+        phase: Phase,
+    };
+
+    const Harness = struct {
+        phase: Phase = .idle,
+        pub fn step(self: *@This(), act: Act) !void {
+            switch (act) {
+                .step_fwd => self.phase = .working,
+            }
+        }
+        pub fn project(self: *const @This()) Proj {
+            return .{ .state = 42, .phase = self.phase };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    // When state_var_name is "phase", before: "idle" must compare against "phase", NOT "state" (which is u32)
+    const trace =
+        \\[{"action": "step_fwd", "before": "idle", "phase": "working", "state": 42}]
+    ;
+    var h = Harness{};
+    const stats = try replayJsonTraceWithOptions(Act, &h, alloc, trace, null, .{
+        .state_var_name = "phase",
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.actions_replayed);
+    try std.testing.expectEqual(@as(usize, 1), stats.states_verified);
+}
+
+test "replayJsonTrace preserves disallowed infrastructure error over mutation status" {
+    const Act = enum { fail_oom };
+
+    const Harness = struct {
+        mutated: bool = false,
+        pub fn step(self: *@This(), act: Act) !void {
+            switch (act) {
+                .fail_oom => {
+                    self.mutated = true;
+                    return error.OutOfMemory;
+                },
+            }
+        }
+        pub fn project(self: *const @This()) struct { val: u32 } {
+            return .{ .val = if (self.mutated) 1 else 0 };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const trace =
+        \\[{"action": "fail_oom", "rejected": true}]
+    ;
+    var h = Harness{};
+    // Even though state mutated, OutOfMemory must not be masked as RejectedButMutated
+    try std.testing.expectError(error.OutOfMemory, replayJsonTrace(Act, &h, alloc, trace, null));
 }

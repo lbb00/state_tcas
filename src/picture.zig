@@ -214,6 +214,7 @@ pub const Picture = struct {
 
     /// Export recorded transition steps as an Apalache ADR-015 compliant ITF JSON trace.
     pub fn renderItfJson(self: *const Picture, allocator: std.mem.Allocator, options: RenderItfOptions) ![]u8 {
+        try validateStateVarName(options.state_var_name);
         if (!self.record_steps) return error.StepsNotRecorded;
 
         var valid_step_count: usize = 0;
@@ -405,12 +406,39 @@ fn isStrictJsonNumber(s: []const u8) bool {
     return i == s.len;
 }
 
+pub fn validateStateVarName(name: []const u8) !void {
+    if (name.len == 0 or
+        std.mem.eql(u8, name, "action") or
+        std.mem.eql(u8, name, "actionTaken") or
+        std.mem.eql(u8, name, "mbt::actionTaken") or
+        std.mem.eql(u8, name, "payload") or
+        std.mem.eql(u8, name, "mbt::nondetPicks") or
+        std.mem.eql(u8, name, "after") or
+        std.mem.eql(u8, name, "before") or
+        std.mem.eql(u8, name, "rejected") or
+        std.mem.eql(u8, name, "from") or
+        std.mem.eql(u8, name, "to") or
+        std.mem.eql(u8, name, "from_role") or
+        std.mem.eql(u8, name, "to_role") or
+        std.mem.eql(u8, name, "#meta") or
+        std.mem.eql(u8, name, "step") or
+        std.mem.eql(u8, name, "note"))
+    {
+        return error.InvalidStateVariableName;
+    }
+}
+
 fn appendJsonPayload(out: *std.ArrayList(u8), allocator: std.mem.Allocator, p_str: []const u8) !void {
     if (std.mem.eql(u8, p_str, "true") or std.mem.eql(u8, p_str, "false") or std.mem.eql(u8, p_str, "null")) {
         try out.appendSlice(allocator, p_str);
         return;
     }
     if (isStrictJsonNumber(p_str)) {
+        const is_float = (std.mem.indexOfAny(u8, p_str, ".eE") != null);
+        if (is_float) {
+            try out.appendSlice(allocator, p_str);
+            return;
+        }
         const max_safe_int: i64 = 9007199254740991;
         const min_safe_int: i64 = -9007199254740991;
         if (std.fmt.parseInt(i64, p_str, 10)) |val| {
@@ -420,7 +448,15 @@ fn appendJsonPayload(out: *std.ArrayList(u8), allocator: std.mem.Allocator, p_st
                 try out.appendSlice(allocator, "\"}");
                 return;
             }
-        } else |_| {}
+        } else |err| switch (err) {
+            error.Overflow => {
+                try out.appendSlice(allocator, "{\"#bigint\": \"");
+                try out.appendSlice(allocator, p_str);
+                try out.appendSlice(allocator, "\"}");
+                return;
+            },
+            else => {},
+        }
         try out.appendSlice(allocator, p_str);
         return;
     }
@@ -992,4 +1028,35 @@ test "Picture.renderItfJson emits valid JSON numbers and adheres to ADR-015 vars
     // State 3: bigint has #bigint wrapper
     const bigint_obj = states.items[3].object.get("payload").?.object;
     try std.testing.expectEqualStrings("9007199254740992", bigint_obj.get("#bigint").?.string);
+}
+
+test "Picture.renderItfJson handles integer overflowing i64 and validates state_var_name" {
+    const allocator = std.testing.allocator;
+    var pic = Picture{};
+    defer pic.deinit(allocator);
+
+    try pic.observe(allocator, .{
+        .before = "s0",
+        .after = "s1",
+        .label = "huge(99999999999999999999)",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+
+    // 1. Invalid state variable names rejected
+    try std.testing.expectError(error.InvalidStateVariableName, pic.renderItfJson(allocator, .{ .state_var_name = "" }));
+    try std.testing.expectError(error.InvalidStateVariableName, pic.renderItfJson(allocator, .{ .state_var_name = "action" }));
+    try std.testing.expectError(error.InvalidStateVariableName, pic.renderItfJson(allocator, .{ .state_var_name = "payload" }));
+
+    // 2. Huge integer beyond i64 wrapped in #bigint
+    const itf = try pic.renderItfJson(allocator, .{});
+    defer allocator.free(itf);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, itf, .{});
+    defer parsed.deinit();
+
+    const states = parsed.value.object.get("states").?.array;
+    const huge_obj = states.items[1].object.get("payload").?.object;
+    try std.testing.expectEqualStrings("99999999999999999999", huge_obj.get("#bigint").?.string);
 }
