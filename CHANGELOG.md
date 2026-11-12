@@ -19,15 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ReplayStats.verifyCoverage(Act, pic)`: One-line coverage assertion on trace replay statistics.
 - **Apalache ADR-015 ITF Trace Export (`st.picture`)**:
   - `Picture.renderItfJson`: Render recorded exploration steps as standard Apalache ADR-015 compliant Informal Trace Format (ITF) JSON traces with step continuity verification (`error.DiscontinuousTrace`, `error.EmptyTrace`), skipping rejected steps, and emitting `mbt::actionTaken` annotations.
+- **Custom State Variable Configuration (`st.picture`, `st.tla`)**:
+  - `RenderItfOptions.state_var_name` and `ReplayOptions.state_var_name`: Configure custom primary state variable name for ITF export and trace replay, validated against reserved keywords via `validateStateVarName` (`error.InvalidStateVariableName`).
+- **Rejection State Immutability & Deep Cloning (`st.tla`)**:
+  - `error.RejectedButMutated`: Rejection immutability verification ensuring that steps asserting `rejected: true` (or rejecting in step execution/guard) do not mutate the harness state snapshot.
+  - `deepClone`: Deep recursive allocator-based cloning for slices (including sentinel-terminated and aligned slices), single-item pointers, structs (skipping comptime fields), arrays, optionals, and tagged unions.
 
 ### Changed
 
 - **Trace Replay Verification Strictness (`st.tla`)**:
   - In `replayJsonTraceWithOptions`, detect custom state variables in JSON/ITF step objects that are not checked by scalar/enum projections, raising `error.TraceVariablesUnverified` by default to prevent false confidence when a trace specifies multi-variable state assertions. Added `allow_unverified_variables: bool = false` to `ReplayOptions` for explicit opt-in.
   - Trace event fields (`before`, `rejected`) emitted by serializers are now actively verified: mismatched `before` projections return `error.TraceDiverged`, and unfulfilled rejections return `error.RejectionExpected`.
+  - `before` assertion verification aligns trace ingest validation and step execution against the primary state variable, rejecting incompatible projections early with `error.ProjectionUnavailable`.
+  - Disallowed infrastructure errors (e.g. `OutOfMemory`) take precedence over mutation checks during rejected steps.
 
 ### Fixed
 
+- **Large Integer Bigint Serialization (`st.picture`)**:
+  - Wrapped integers beyond 64-bit safe bounds into ADR-015 `{"#bigint": "..."}` objects upon parse overflow in `appendJsonPayload`.
 - **Allocation-Free `parseAct` for Zig 0.17 (`st.tla`)**:
   - Refactored `parseAct` to use `std.meta.stringToEnum` for enum actions and inline inspection for void union variants without invoking heap allocators, resolving compatibility with Zig 0.17 std library.
 
