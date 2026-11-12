@@ -25,6 +25,7 @@ const Edge = struct {
     source: []u8,
     label: []u8,
     target: []u8,
+    rejected: bool = false,
 };
 
 const Step = struct {
@@ -86,6 +87,7 @@ pub const Picture = struct {
                     .source = source,
                     .label = label,
                     .target = target,
+                    .rejected = o.rejected,
                 });
             }
         }
@@ -191,6 +193,7 @@ pub const Picture = struct {
         inline for (names) |f_name| {
             var covered = false;
             for (self.edges.items) |edge| {
+                if (edge.rejected) continue;
                 if (matchActionLabel(edge.label, f_name)) {
                     covered = true;
                     break;
@@ -211,6 +214,8 @@ pub const Picture = struct {
 
     /// Export recorded transition steps as an Apalache ADR-015 compliant ITF JSON trace.
     pub fn renderItfJson(self: *const Picture, allocator: std.mem.Allocator, options: RenderItfOptions) ![]u8 {
+        if (!self.record_steps) return error.StepsNotRecorded;
+
         var valid_step_count: usize = 0;
         for (self.steps.items) |step| {
             if (!step.rejected) valid_step_count += 1;
@@ -240,7 +245,7 @@ pub const Picture = struct {
         try out.appendSlice(allocator, "\n  },\n  \"vars\": [");
         try appendJsonEscapedString(&out, allocator, options.state_var_name);
         if (options.include_actions) {
-            try out.appendSlice(allocator, ", \"mbt::actionTaken\"");
+            try out.appendSlice(allocator, ", \"action\", \"mbt::actionTaken\"");
         }
         try out.appendSlice(allocator, "],\n  \"states\": [\n");
 
@@ -274,12 +279,22 @@ pub const Picture = struct {
             try out.appendSlice(allocator, "},\n");
 
             if (options.include_actions) {
+                const parts = splitActionLabel(step.label);
                 try out.appendSlice(allocator, "      \"action\": ");
-                try appendJsonEscapedString(&out, allocator, step.label);
+                try appendJsonEscapedString(&out, allocator, parts.name);
                 try out.appendSlice(allocator, ",\n");
                 try out.appendSlice(allocator, "      \"mbt::actionTaken\": ");
-                try appendJsonEscapedString(&out, allocator, step.label);
+                try appendJsonEscapedString(&out, allocator, parts.name);
                 try out.appendSlice(allocator, ",\n");
+                if (parts.payload) |p_str| {
+                    try out.appendSlice(allocator, "      \"payload\": ");
+                    if (isJsonNumber(p_str)) {
+                        try out.appendSlice(allocator, p_str);
+                    } else {
+                        try appendJsonEscapedString(&out, allocator, p_str);
+                    }
+                    try out.appendSlice(allocator, ",\n");
+                }
             }
 
             try out.appendSlice(allocator, "      ");
@@ -292,6 +307,32 @@ pub const Picture = struct {
         return out.toOwnedSlice(allocator);
     }
 };
+
+fn splitActionLabel(label: []const u8) struct { name: []const u8, payload: ?[]const u8 } {
+    if (std.mem.indexOfScalar(u8, label, '(')) |p_open| {
+        if (std.mem.lastIndexOfScalar(u8, label, ')')) |p_close| {
+            if (p_close > p_open) {
+                return .{
+                    .name = label[0..p_open],
+                    .payload = label[p_open + 1 .. p_close],
+                };
+            }
+        }
+        return .{ .name = label[0..p_open], .payload = null };
+    }
+    return .{ .name = label, .payload = null };
+}
+
+fn isJsonNumber(str: []const u8) bool {
+    if (str.len == 0) return false;
+    var i: usize = 0;
+    if (str[0] == '-') i += 1;
+    if (i >= str.len) return false;
+    while (i < str.len) : (i += 1) {
+        if (str[i] < '0' or str[i] > '9') return false;
+    }
+    return true;
+}
 
 pub const RenderItfOptions = struct {
     description: []const u8 = "state_tcas counterexample trace",
@@ -721,4 +762,47 @@ test "Picture.renderItfJson rejects discontinuous or empty traces and skips reje
         .note = "",
     });
     try std.testing.expectError(error.DiscontinuousTrace, pic.renderItfJson(allocator, .{}));
+}
+
+test "Picture.verifyCoverage rejects coverage when action only appeared in rejected edges" {
+    const allocator = std.testing.allocator;
+    const Act = enum { a, b };
+
+    var pic = Picture{ .record_steps = false };
+    defer pic.deinit(allocator);
+
+    // Observe 'a' successfully
+    try pic.observe(allocator, .{
+        .before = "s0",
+        .after = "s1",
+        .label = "a",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+
+    // Observe 'b' only as a rejected unchanged edge (keep_unchanged = true)
+    try pic.observe(allocator, .{
+        .before = "s1",
+        .after = "s1",
+        .label = "b",
+        .rejected = true,
+        .mutated = false,
+        .keep_unchanged = true,
+        .note = "rejected",
+    });
+
+    // 'b' must not be counted as covered!
+    try std.testing.expectError(error.ActUncovered, pic.verifyCoverage(Act));
+
+    // Now observe 'b' successfully
+    try pic.observe(allocator, .{
+        .before = "s1",
+        .after = "s2",
+        .label = "b",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+    try pic.verifyCoverage(Act);
 }

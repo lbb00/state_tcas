@@ -389,6 +389,7 @@ const MarkerMatch = struct {
 };
 
 fn findMarkerLine(content: []const u8, marker: []const u8, search_start: usize) !?MarkerMatch {
+    const trimmed_marker = std.mem.trim(u8, marker, " \t");
     var cursor = search_start;
     var found_match: ?MarkerMatch = null;
 
@@ -404,7 +405,7 @@ fn findMarkerLine(content: []const u8, marker: []const u8, search_start: usize) 
         }
 
         const trimmed = std.mem.trim(u8, line_body, " \t");
-        if (std.mem.eql(u8, trimmed, marker)) {
+        if (std.mem.eql(u8, trimmed, trimmed_marker)) {
             if (found_match != null) {
                 return error.AmbiguousSectionMarkers;
             }
@@ -462,6 +463,10 @@ pub fn lockWithOptions(
     if (!isValidTlaIdentifier(module_name) or isTlaPreludeCollision(module_name)) {
         return error.InvalidTlaIdentifier;
     }
+    if (options.section) |sec| {
+        try validateMarker(sec.begin_marker);
+        try validateMarker(sec.end_marker);
+    }
     const base = std.fs.path.basename(path);
     if (!std.mem.endsWith(u8, base, ".tla")) {
         return error.InvalidFilePath;
@@ -514,15 +519,18 @@ pub fn lockWithOptions(
         b_match = (try findMarkerLine(actual, sec.begin_marker, 0)) orelse return error.SectionMarkersMissing;
         e_match = (try findMarkerLine(actual, sec.end_marker, b_match.?.line_end)) orelse return error.SectionMarkersMissing;
     } else {
-        const auto_b = try findMarkerLine(actual, "\\* BEGIN DECLARATIONS", 0);
-        if (auto_b) |bm| {
-            const auto_e = try findMarkerLine(actual, "\\* END DECLARATIONS", bm.line_end);
-            if (auto_e) |em| {
-                detected_begin = "\\* BEGIN DECLARATIONS";
-                detected_end = "\\* END DECLARATIONS";
-                b_match = bm;
-                e_match = em;
+        const has_any_b = (try findMarkerLine(actual, "\\* BEGIN DECLARATIONS", 0)) != null;
+        const has_any_e = (try findMarkerLine(actual, "\\* END DECLARATIONS", 0)) != null;
+        if (has_any_b or has_any_e) {
+            if (!has_any_b or !has_any_e) {
+                return error.SectionMarkersMissing;
             }
+            const bm = (try findMarkerLine(actual, "\\* BEGIN DECLARATIONS", 0)).?;
+            const em = (try findMarkerLine(actual, "\\* END DECLARATIONS", bm.line_end)) orelse return error.SectionMarkersMissing;
+            detected_begin = "\\* BEGIN DECLARATIONS";
+            detected_end = "\\* END DECLARATIONS";
+            b_match = bm;
+            e_match = em;
         }
     }
 
@@ -1048,6 +1056,8 @@ pub const ReplayOptions = struct {
     /// contains custom state variables not verified by a scalar/enum projection.
     /// Set to true to allow unverified trace variables to be silently ignored.
     allow_unverified_variables: bool = false,
+    /// Name of state variable in trace step objects (defaults to "state").
+    state_var_name: []const u8 = "state",
 };
 
 fn tryCloneCtx(ctx: anytype) !Unwrap(@TypeOf(ctx)) {
@@ -1240,7 +1250,8 @@ fn inferTransitionAction(
 /// (e.g., enabling guard rejections, step error rejections, or trace divergence).
 pub const StepOutcome = union(enum) {
     success,
-    domain_rejection: anyerror,
+    action_rejected: anyerror,
+    state_diverged: anyerror,
 };
 
 fn StructExpectation(comptime S: type) type {
@@ -1265,7 +1276,8 @@ fn StepPlan(comptime Act: type, comptime ProjType: type) type {
     };
 }
 
-fn isKnownStepField(name: []const u8) bool {
+fn isKnownStepField(name: []const u8, custom_state_var: []const u8) bool {
+    if (std.mem.eql(u8, name, custom_state_var)) return true;
     return std.mem.eql(u8, name, "action") or
         std.mem.eql(u8, name, "actionTaken") or
         std.mem.eql(u8, name, "mbt::actionTaken") or
@@ -1371,6 +1383,13 @@ fn ingestStepPlan(
                 }
             }
 
+            if (obj.get(options.state_var_name)) |v| {
+                if (v == .string) {
+                    if (exp_state_name != null and !std.mem.eql(u8, exp_state_name.?, v.string)) return error.InvalidTraceFormat;
+                    exp_state_name = v.string;
+                }
+            }
+
             if (exp_state_name != null) {
                 has_state_assertion = true;
             } else if (is_struct_proj) {
@@ -1381,7 +1400,8 @@ fn ingestStepPlan(
                             const is_aft_field = comptime std.mem.eql(u8, sf_name, "after");
                             if (obj.get(sf_name) != null or
                                 (is_st_field and obj.get("after") != null) or
-                                (is_aft_field and obj.get("state") != null))
+                                (is_aft_field and obj.get("state") != null) or
+                                (is_st_field and obj.get(options.state_var_name) != null))
                             {
                                 has_state_assertion = true;
                                 break;
@@ -1403,7 +1423,7 @@ fn ingestStepPlan(
             if (has_project and !is_struct_proj and !options.allow_unverified_variables) {
                 var it = obj.iterator();
                 while (it.next()) |entry| {
-                    if (!isKnownStepField(entry.key_ptr.*)) {
+                    if (!isKnownStepField(entry.key_ptr.*, options.state_var_name)) {
                         return error.TraceVariablesUnverified;
                     }
                 }
@@ -1535,16 +1555,48 @@ fn executeStepPlan(
     if (plan.expected_before) |exp_before| {
         if (has_project) {
             const cur_st = ctx.project();
-            if (!is_struct_proj) {
+            if (is_struct_proj) {
+                const s = @typeInfo(ProjType).@"struct";
+                var matched = false;
+                inline for (s.field_names) |f_name| {
+                    if (comptime (std.mem.eql(u8, f_name, "state") or std.mem.eql(u8, f_name, "before"))) {
+                        const sub_val = @field(cur_st, f_name);
+                        const sub_val_str: ?[]const u8 = switch (@typeInfo(@TypeOf(sub_val))) {
+                            .@"enum" => @tagName(sub_val),
+                            .pointer => |p| if (p.size == .slice and p.child == u8) sub_val else null,
+                            else => null,
+                        };
+                        if (sub_val_str) |s_str| {
+                            if (!std.mem.eql(u8, s_str, exp_before)) {
+                                return .{ .state_diverged = error.TraceDiverged };
+                            }
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if (!matched) {
+                    return .{ .state_diverged = error.TraceDiverged };
+                }
+            } else {
                 const cur_st_str: ?[]const u8 = switch (@typeInfo(ProjType)) {
                     .@"enum" => @tagName(cur_st),
-                    .pointer => |p| if (p.size == .slice and p.child == u8) cur_st else null,
+                    .pointer => |p| switch (p.size) {
+                        .slice => if (p.child == u8) cur_st else null,
+                        .one => switch (@typeInfo(p.child)) {
+                            .array => |arr| if (arr.child == u8) cur_st[0..arr.len] else null,
+                            else => null,
+                        },
+                        else => null,
+                    },
                     else => null,
                 };
                 if (cur_st_str) |s_str| {
                     if (!std.mem.eql(u8, s_str, exp_before)) {
-                        return .{ .domain_rejection = error.TraceDiverged };
+                        return .{ .state_diverged = error.TraceDiverged };
                     }
+                } else {
+                    return .{ .state_diverged = error.TraceDiverged };
                 }
             }
         }
@@ -1561,14 +1613,19 @@ fn executeStepPlan(
                     break;
                 }
             }
-            if (!is_en) return .{ .domain_rejection = error.ActionNotEnabled };
+            if (!is_en) return .{ .action_rejected = error.ActionNotEnabled };
         }
 
         // 2. Dispatch step
         dispatchStep(ctx, act, pic) catch |err| {
-            return .{ .domain_rejection = err };
+            return .{ .action_rejected = err };
         };
         stats.actions_replayed += 1;
+
+        // If step asserted rejection, successful dispatch is a failure
+        if (plan.expected_rejected != null and plan.expected_rejected.? == true) {
+            return .{ .action_rejected = error.RejectionExpected };
+        }
     }
 
     // 3. State projection check
@@ -1591,15 +1648,15 @@ fn executeStepPlan(
                         };
                         if (sub_val_str) |s_str| {
                             if (!std.mem.eql(u8, s_str, plan.struct_expectation.string_alias.?)) {
-                                return .{ .domain_rejection = error.TraceDiverged };
+                                return .{ .state_diverged = error.TraceDiverged };
                             }
                             verified_count += 1;
                         } else {
-                            return .{ .domain_rejection = error.TraceDiverged };
+                            return .{ .state_diverged = error.TraceDiverged };
                         }
                     } else {
                         if (!deepEql(sf_type, @field(cur_st, sf_name), @field(plan.struct_expectation.values, sf_name))) {
-                            return .{ .domain_rejection = error.TraceDiverged };
+                            return .{ .state_diverged = error.TraceDiverged };
                         }
                         verified_count += 1;
                     }
@@ -1614,21 +1671,21 @@ fn executeStepPlan(
                 switch (@typeInfo(ProjType)) {
                     .@"enum" => {
                         if (!std.mem.eql(u8, @tagName(cur_st), exp_st)) {
-                            return .{ .domain_rejection = error.TraceDiverged };
+                            return .{ .state_diverged = error.TraceDiverged };
                         }
                         stats.states_verified += 1;
                     },
                     .pointer => |p| switch (p.size) {
                         .slice => if (p.child == u8) {
                             if (!std.mem.eql(u8, cur_st, exp_st)) {
-                                return .{ .domain_rejection = error.TraceDiverged };
+                                return .{ .state_diverged = error.TraceDiverged };
                             }
                             stats.states_verified += 1;
                         } else @compileError("project() pointer must be []const u8"),
                         .one => switch (@typeInfo(p.child)) {
                             .array => |arr| if (arr.child == u8) {
                                 if (!std.mem.eql(u8, cur_st[0..arr.len], exp_st)) {
-                                    return .{ .domain_rejection = error.TraceDiverged };
+                                    return .{ .state_diverged = error.TraceDiverged };
                                 }
                                 stats.states_verified += 1;
                             } else @compileError("project() array pointer must be string"),
@@ -1745,17 +1802,34 @@ pub fn replayJsonTraceWithOptions(
                     }
                 }
             },
-            .domain_rejection => |rej_err| {
+            .action_rejected => |act_err| {
                 if (plan.expected_rejected != null and plan.expected_rejected.? == true) {
+                    if (act_err == error.RejectionExpected) {
+                        return error.RejectionExpected;
+                    }
+                    if (options.expect_rejection) |exp| {
+                        if (step_index == exp.at_step) {
+                            if (act_err != exp.err) return act_err;
+                            return stats;
+                        }
+                    }
                     stats.steps += 1;
                     continue;
                 }
                 if (options.expect_rejection) |exp| {
-                    if (step_index == exp.at_step and rej_err == exp.err) {
+                    if (step_index == exp.at_step and act_err == exp.err) {
                         return stats;
                     }
                 }
-                return rej_err;
+                return act_err;
+            },
+            .state_diverged => |div_err| {
+                if (options.expect_rejection) |exp| {
+                    if (step_index == exp.at_step and div_err == exp.err) {
+                        return stats;
+                    }
+                }
+                return div_err;
             },
         }
     }
@@ -2116,6 +2190,9 @@ pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8
                     break;
                 }
             }
+            idx = eq_start + 1;
+            is_line_start = false;
+            continue;
         }
 
         is_line_start = false;
@@ -4101,4 +4178,81 @@ test "lockWithOptions handles sectional file creation, line-anchored matching, a
     // 4. Invalid marker syntax rejected by formatDeclarationSectionWithMarkers
     try std.testing.expectError(error.InvalidMarker, formatDeclarationSectionWithMarkers(alloc, "NOT_A_COMMENT", "\\* END", Act, null, null));
     try std.testing.expectError(error.InvalidMarker, formatDeclarationSectionWithMarkers(alloc, "\\* MULTILINE\nMARKER", "\\* END", Act, null, null));
+
+    // 5. Incomplete marker pairs in auto-detect mode return SectionMarkersMissing without whole-file overwrite
+    const missing_end_path = try std.fmt.allocPrint(alloc, "{s}/MissingEndModel.tla", .{full_dir});
+    defer alloc.free(missing_end_path);
+    const missing_end_spec =
+        \\---- MODULE MissingEndModel ----
+        \\\* BEGIN DECLARATIONS
+        \\Init == TRUE
+        \\====
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "MissingEndModel.tla", .data = missing_end_spec });
+    try std.testing.expectError(error.SectionMarkersMissing, lockWithOptions(io, alloc, missing_end_path, "MissingEndModel", Act, null, null, .{}));
+
+    const missing_begin_path = try std.fmt.allocPrint(alloc, "{s}/MissingBeginModel.tla", .{full_dir});
+    defer alloc.free(missing_begin_path);
+    const missing_begin_spec =
+        \\---- MODULE MissingBeginModel ----
+        \\\* END DECLARATIONS
+        \\Init == TRUE
+        \\====
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "MissingBeginModel.tla", .data = missing_begin_spec });
+    try std.testing.expectError(error.SectionMarkersMissing, lockWithOptions(io, alloc, missing_begin_path, "MissingBeginModel", Act, null, null, .{}));
+}
+
+test "replayJsonTrace rejected verification prevents mutative passes and verifies custom state var" {
+    const Act = enum { start, stop };
+    const State = enum { idle, running };
+
+    const Harness = struct {
+        st: State = .idle,
+        pub fn step(self: *@This(), act: Act) !void {
+            switch (act) {
+                .start => self.st = .running,
+                .stop => return error.ActionNotAllowed,
+            }
+        }
+        pub fn project(self: *const @This()) State {
+            return self.st;
+        }
+    };
+
+    // 1. C1 regression: trace asserts rejected: true, but action succeeds and mutates state -> RejectionExpected!
+    const mutative_rej_trace =
+        \\[{"action": "start", "before": "idle", "after": "idle", "rejected": true}]
+    ;
+    var h1 = Harness{};
+    try std.testing.expectError(error.RejectionExpected, replayJsonTrace(Act, &h1, std.testing.allocator, mutative_rej_trace, null));
+
+    // 2. Mismatched before on rejected step produces TraceDiverged, not swallowed by rejected: true
+    const bad_before_rej_trace =
+        \\[{"action": "stop", "before": "running", "after": "running", "rejected": true}]
+    ;
+    var h2 = Harness{};
+    try std.testing.expectError(error.TraceDiverged, replayJsonTrace(Act, &h2, std.testing.allocator, bad_before_rej_trace, null));
+
+    // 3. Custom state_var_name round-trip without TraceVariablesUnverified
+    const custom_var_trace =
+        \\[{"action": "start", "before": "idle", "phase": "running"}]
+    ;
+    var h3 = Harness{};
+    const stats3 = try replayJsonTraceWithOptions(Act, &h3, std.testing.allocator, custom_var_trace, null, .{
+        .state_var_name = "phase",
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats3.actions_replayed);
+    try std.testing.expectEqual(State.running, h3.st);
+}
+
+test "validateSpecSyntax handles lines beginning with equals without character skipping" {
+    const alloc = std.testing.allocator;
+    const spec =
+        \\---- MODULE EqTest ----
+        \\Inv ==
+        \\  =(1 + 2)
+        \\====
+    ;
+    try validateSpecSyntax(alloc, spec);
 }
