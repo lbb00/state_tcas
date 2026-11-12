@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Custom State Variable Configuration (`st.picture`, `st.tla`)**:
   - `RenderItfOptions.state_var_name` and `ReplayOptions.state_var_name`: Configure custom primary state variable name for ITF export and trace replay, validated against reserved keywords via `validateStateVarName` (`error.InvalidStateVariableName`).
 - **Rejection State Immutability & Deep Cloning (`st.tla`)**:
-  - `error.RejectedButMutated`: Rejection immutability verification ensuring that steps asserting `rejected: true` (or rejecting in step execution/guard) do not mutate the harness state snapshot.
+  - `error.RejectedButMutated`: Rejection immutability verification ensuring that trace steps explicitly asserting `rejected: true` do not mutate the harness state snapshot.
   - `deepClone`: Deep recursive allocator-based cloning for slices (including sentinel-terminated and aligned slices), single-item pointers, structs (skipping comptime fields), arrays, optionals, and tagged unions.
 
 ### Changed

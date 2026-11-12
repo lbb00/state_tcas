@@ -1145,6 +1145,7 @@ pub fn deepClone(comptime T: type, allocator: std.mem.Allocator, val: T) anyerro
     }
 }
 
+/// Replay configuration options. State immutability (error.RejectedButMutated) is checked only when trace steps explicitly declare rejected: true.
 pub const ReplayOptions = struct {
     /// Expected rejection specification for negative counterexample regression testing.
     /// When specified, replay expects a failure at `at_step` with `err`.
@@ -1850,14 +1851,13 @@ fn executeStepPlan(
     plan: StepPlan(Act, ProjType),
     pic: ?*picture.Picture,
     stats: *ReplayStats,
-    options: ReplayOptions,
     arena_allocator: std.mem.Allocator,
 ) anyerror!StepOutcome {
-    _ = options;
     const CtxType = Unwrap(@TypeOf(ctx));
     const has_enabled = @hasDecl(CtxType, "enabled");
     const has_project = @hasDecl(CtxType, "project");
     const is_struct_proj = (has_project and comptime @typeInfo(ProjType) == .@"struct");
+    // Pre-transition snapshot is cloned in arena only when trace explicitly asserts rejected: true to verify post-rejection immutability.
     const pre_snapshot = if (has_project and plan.expected_rejected != null and plan.expected_rejected.? == true)
         try deepClone(ProjType, arena_allocator, ctx.project())
     else
@@ -2075,7 +2075,7 @@ pub fn replayJsonTraceWithOptions(
 
     for (items, 0..) |item, step_index| {
         const plan = try ingestStepPlan(Act, ProjType, ctx, item, step_index, trace_info, options, arena_allocator);
-        const outcome = try executeStepPlan(Act, ProjType, ctx, plan, pic, &stats, options, arena_allocator);
+        const outcome = try executeStepPlan(Act, ProjType, ctx, plan, pic, &stats, arena_allocator);
         switch (outcome) {
             .success => {
                 if (plan.expected_rejected != null and plan.expected_rejected.? == true) {
