@@ -1217,6 +1217,12 @@ fn isKnownStepField(name: []const u8) bool {
         std.mem.eql(u8, name, "mbt::nondetPicks") or
         std.mem.eql(u8, name, "state") or
         std.mem.eql(u8, name, "after") or
+        std.mem.eql(u8, name, "before") or
+        std.mem.eql(u8, name, "rejected") or
+        std.mem.eql(u8, name, "from") or
+        std.mem.eql(u8, name, "to") or
+        std.mem.eql(u8, name, "from_role") or
+        std.mem.eql(u8, name, "to_role") or
         std.mem.eql(u8, name, "#meta") or
         std.mem.eql(u8, name, "step") or
         std.mem.eql(u8, name, "note");
@@ -1861,59 +1867,22 @@ pub fn checkExtends(spec_content: []const u8, module_name: []const u8) bool {
 }
 
 /// Validates basic structural syntax of a TLA+ specification without external tools (pure Zig):
-/// - Enforces module header `---- MODULE <Name> ----` with a valid identifier.
-/// - Enforces module footer `====`.
+/// - Enforces module header `---- MODULE <Name> ----` with a valid identifier outside comments and strings.
+/// - Enforces module footer `====` outside comments and strings.
 /// - Checks balanced delimiters: `()`, `[]`, `{}`, `<<>>`.
 /// - Checks unclosed string literals and unclosed nested block comments `(* ... *)`.
 pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8) !void {
-    // 1. Module header validation
-    const header_idx = std.mem.indexOf(u8, spec_content, "MODULE ") orelse return error.MissingModuleHeader;
-    var dash_before: usize = 0;
-    var i: usize = header_idx;
-    while (i > 0) {
-        i -= 1;
-        const c = spec_content[i];
-        if (c == '-') {
-            dash_before += 1;
-        } else if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
-            if (dash_before > 0) break;
-        } else {
-            break;
-        }
-    }
-    if (dash_before < 4) return error.MissingModuleHeader;
-
-    var name_start: usize = header_idx + 7;
-    while (name_start < spec_content.len and (spec_content[name_start] == ' ' or spec_content[name_start] == '\t')) {
-        name_start += 1;
-    }
-    var name_end: usize = name_start;
-    while (name_end < spec_content.len and spec_content[name_end] != ' ' and spec_content[name_end] != '\t' and spec_content[name_end] != '-' and spec_content[name_end] != '\r' and spec_content[name_end] != '\n') {
-        name_end += 1;
-    }
-    const mod_name = spec_content[name_start..name_end];
-    if (mod_name.len == 0 or !isValidTlaIdentifier(mod_name)) return error.InvalidTlaIdentifier;
-
-    var dash_after: usize = 0;
-    var j: usize = name_end;
-    while (j < spec_content.len and spec_content[j] != '\n') : (j += 1) {
-        if (spec_content[j] == '-') dash_after += 1;
-    }
-    if (dash_after < 4) return error.MissingModuleHeader;
-
-    // 2. Module footer validation
-    const footer_idx = std.mem.lastIndexOf(u8, spec_content, "====") orelse return error.MissingModuleFooter;
-    if (footer_idx < header_idx) return error.MissingModuleFooter;
-
-    // 3. Balanced delimiter and comment/string scanner
     var stack: std.ArrayList(u8) = .empty;
     defer stack.deinit(allocator);
 
+    var found_header = false;
+    var found_footer = false;
     var cursor: usize = 0;
+
     while (cursor < spec_content.len) {
         const c = spec_content[cursor];
 
-        // Block comments: (* ... *)
+        // 1. Block comments: (* ... *)
         if (cursor + 1 < spec_content.len and c == '(' and spec_content[cursor + 1] == '*') {
             cursor += 2;
             var depth: usize = 1;
@@ -1932,7 +1901,7 @@ pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8
             continue;
         }
 
-        // Single-line comments: \* ... \n
+        // 2. Single-line comments: \* ... \n
         if (cursor + 1 < spec_content.len and c == '\\' and spec_content[cursor + 1] == '*') {
             cursor += 2;
             while (cursor < spec_content.len and spec_content[cursor] != '\n') {
@@ -1941,7 +1910,7 @@ pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8
             continue;
         }
 
-        // String literals: "..."
+        // 3. String literals: "..."
         if (c == '"') {
             cursor += 1;
             var closed = false;
@@ -1964,7 +1933,51 @@ pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8
             continue;
         }
 
-        // Sequence / tuple brackets: << and >>
+        // 4. Module header check: at least 4 dashes followed by MODULE and identifier
+        if (!found_header and c == '-') {
+            const dash_start = cursor;
+            while (cursor < spec_content.len and spec_content[cursor] == '-') : (cursor += 1) {}
+            const dash_count = cursor - dash_start;
+            if (dash_count >= 4) {
+                while (cursor < spec_content.len and (spec_content[cursor] == ' ' or spec_content[cursor] == '\t')) : (cursor += 1) {}
+                if (cursor + 7 <= spec_content.len and std.mem.eql(u8, spec_content[cursor .. cursor + 7], "MODULE ")) {
+                    cursor += 7;
+                    while (cursor < spec_content.len and (spec_content[cursor] == ' ' or spec_content[cursor] == '\t')) : (cursor += 1) {}
+                    const id_start = cursor;
+                    while (cursor < spec_content.len and (
+                        (spec_content[cursor] >= 'a' and spec_content[cursor] <= 'z') or
+                        (spec_content[cursor] >= 'A' and spec_content[cursor] <= 'Z') or
+                        (spec_content[cursor] >= '0' and spec_content[cursor] <= '9') or
+                        spec_content[cursor] == '_'
+                    )) : (cursor += 1) {}
+                    const mod_name = spec_content[id_start..cursor];
+                    if (mod_name.len == 0 or !isValidTlaIdentifier(mod_name)) {
+                        return error.InvalidTlaIdentifier;
+                    }
+                    while (cursor < spec_content.len and (spec_content[cursor] == ' ' or spec_content[cursor] == '\t')) : (cursor += 1) {}
+                    const dash_end_start = cursor;
+                    while (cursor < spec_content.len and spec_content[cursor] == '-') : (cursor += 1) {}
+                    if (cursor - dash_end_start >= 4) {
+                        found_header = true;
+                        continue;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // 5. Module footer check: at least 4 equals signs
+        if (found_header and c == '=') {
+            const eq_start = cursor;
+            while (cursor < spec_content.len and spec_content[cursor] == '=') : (cursor += 1) {}
+            if (cursor - eq_start >= 4) {
+                found_footer = true;
+                continue;
+            }
+            continue;
+        }
+
+        // 6. Sequence / tuple brackets: << and >>
         if (cursor + 1 < spec_content.len and c == '<' and spec_content[cursor + 1] == '<') {
             try stack.append(allocator, '<');
             cursor += 2;
@@ -1978,7 +1991,7 @@ pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8
             continue;
         }
 
-        // Delimiters: (, ), [, ], {, }
+        // 7. Delimiters: (, ), [, ], {, }
         switch (c) {
             '(', '[', '{' => {
                 try stack.append(allocator, c);
@@ -2008,6 +2021,8 @@ pub fn validateSpecSyntax(allocator: std.mem.Allocator, spec_content: []const u8
         }
     }
 
+    if (!found_header) return error.MissingModuleHeader;
+    if (!found_footer) return error.MissingModuleFooter;
     if (stack.items.len > 0) return error.UnbalancedDelimiter;
 }
 
@@ -3617,6 +3632,59 @@ test "validateSpecSyntax verifies balanced delimiters, headers, footers, and com
     // 11. Unexpected closing delimiter
     const unexpected_close = "---- MODULE Foo ----\nOp == x + 1)\n====\n";
     try std.testing.expectError(error.UnexpectedDelimiter, validateSpecSyntax(alloc, unexpected_close));
+
+    // 12. Fake header inside block comment must be ignored
+    const fake_header_in_comment =
+        \\(*
+        \\---- MODULE Fake ----
+        \\*)
+        \\====
+    ;
+    try std.testing.expectError(error.MissingModuleHeader, validateSpecSyntax(alloc, fake_header_in_comment));
+
+    // 13. Fake footer inside block comment must be ignored
+    const fake_footer_in_comment =
+        \\---- MODULE Real ----
+        \\(*
+        \\====
+        \\*)
+    ;
+    try std.testing.expectError(error.MissingModuleFooter, validateSpecSyntax(alloc, fake_footer_in_comment));
+}
+
+test "replayJsonTrace accepts trace serializer toJson event fields with scalar projection" {
+    const trace_mod = @import("trace.zig");
+    const Act = enum { ping };
+    const State = enum { idle, done };
+    const Harness = struct {
+        st: State = .idle,
+        pub fn step(self: *@This(), _: Act) !void {
+            self.st = .done;
+        }
+        pub fn project(self: *const @This()) State {
+            return self.st;
+        }
+    };
+
+    var tr = trace_mod.Trace{};
+    defer tr.deinit(std.testing.allocator);
+    try tr.append(std.testing.allocator, .{
+        .action = "ping",
+        .before = "idle",
+        .after = "done",
+        .rejected = false,
+        .from_role = "initiator",
+        .to_role = "responder",
+    });
+
+    const json = try tr.toJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+
+    var h = Harness{};
+    const stats = try replayJsonTrace(Act, &h, std.testing.allocator, json, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.actions_replayed);
+    try std.testing.expectEqual(@as(usize, 1), stats.states_verified);
+    try std.testing.expectEqual(State.done, h.st);
 }
 
 test "Picture.renderItfJson round-trips through replayJsonTrace with full fidelity" {
