@@ -69,11 +69,14 @@ pub const Picture = struct {
         if (o.rejected and o.mutated) return error.RejectedButMutated;
         const changed = !std.mem.eql(u8, o.before, o.after);
         if (self.record_edges and (changed or o.keep_unchanged)) {
-            for (self.edges.items) |edge| {
+            for (self.edges.items) |*edge| {
                 if (std.mem.eql(u8, edge.source, o.before) and
                     std.mem.eql(u8, edge.label, o.label) and
                     std.mem.eql(u8, edge.target, o.after))
                 {
+                    if (!o.rejected) {
+                        edge.rejected = false;
+                    }
                     break;
                 }
             } else {
@@ -135,6 +138,7 @@ pub const Picture = struct {
         try out.appendSlice(allocator, preamble);
         try out.appendSlice(allocator, "```mermaid\nstateDiagram-v2\n");
         for (edges) |edge| {
+            if (edge.rejected) continue;
             try out.appendSlice(allocator, "    ");
             try out.appendSlice(allocator, edge.source);
             try out.appendSlice(allocator, " --> ");
@@ -175,12 +179,8 @@ pub const Picture = struct {
     }
 
     fn matchActionLabel(label: []const u8, action_name: []const u8) bool {
-        if (std.mem.eql(u8, label, action_name)) return true;
-        if (std.mem.startsWith(u8, label, action_name) and label.len > action_name.len) {
-            const sep = label[action_name.len];
-            return sep == '(' or sep == '{' or sep == ':' or sep == ' ';
-        }
-        return false;
+        const parsed = parseActionLabel(label);
+        return std.mem.eql(u8, parsed.name, action_name);
     }
 
     /// Verify that every defined variant of `Act` was recorded in non-rejected steps or edges.
@@ -234,6 +234,18 @@ pub const Picture = struct {
             prev_after = step.after;
         }
 
+        var has_any_payload = false;
+        if (options.include_actions) {
+            for (self.steps.items) |step| {
+                if (step.rejected) continue;
+                const parts = parseActionLabel(step.label);
+                if (parts.payload != null) {
+                    has_any_payload = true;
+                    break;
+                }
+            }
+        }
+
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
 
@@ -246,6 +258,9 @@ pub const Picture = struct {
         try appendJsonEscapedString(&out, allocator, options.state_var_name);
         if (options.include_actions) {
             try out.appendSlice(allocator, ", \"action\", \"mbt::actionTaken\"");
+            if (has_any_payload) {
+                try out.appendSlice(allocator, ", \"payload\"");
+            }
         }
         try out.appendSlice(allocator, "],\n  \"states\": [\n");
 
@@ -261,6 +276,9 @@ pub const Picture = struct {
         if (options.include_actions) {
             try out.appendSlice(allocator, "      \"action\": \"init\",\n");
             try out.appendSlice(allocator, "      \"mbt::actionTaken\": \"init\",\n");
+            if (has_any_payload) {
+                try out.appendSlice(allocator, "      \"payload\": null,\n");
+            }
         }
         try out.appendSlice(allocator, "      ");
         try appendJsonEscapedString(&out, allocator, options.state_var_name);
@@ -279,19 +297,19 @@ pub const Picture = struct {
             try out.appendSlice(allocator, "},\n");
 
             if (options.include_actions) {
-                const parts = splitActionLabel(step.label);
+                const parts = parseActionLabel(step.label);
                 try out.appendSlice(allocator, "      \"action\": ");
                 try appendJsonEscapedString(&out, allocator, parts.name);
                 try out.appendSlice(allocator, ",\n");
                 try out.appendSlice(allocator, "      \"mbt::actionTaken\": ");
                 try appendJsonEscapedString(&out, allocator, parts.name);
                 try out.appendSlice(allocator, ",\n");
-                if (parts.payload) |p_str| {
+                if (has_any_payload) {
                     try out.appendSlice(allocator, "      \"payload\": ");
-                    if (isJsonNumber(p_str)) {
-                        try out.appendSlice(allocator, p_str);
+                    if (parts.payload) |p_str| {
+                        try appendJsonPayload(&out, allocator, p_str);
                     } else {
-                        try appendJsonEscapedString(&out, allocator, p_str);
+                        try out.appendSlice(allocator, "null");
                     }
                     try out.appendSlice(allocator, ",\n");
                 }
@@ -308,30 +326,105 @@ pub const Picture = struct {
     }
 };
 
-fn splitActionLabel(label: []const u8) struct { name: []const u8, payload: ?[]const u8 } {
-    if (std.mem.indexOfScalar(u8, label, '(')) |p_open| {
-        if (std.mem.lastIndexOfScalar(u8, label, ')')) |p_close| {
-            if (p_close > p_open) {
-                return .{
-                    .name = label[0..p_open],
-                    .payload = label[p_open + 1 .. p_close],
-                };
-            }
+pub const ParsedActionLabel = struct {
+    name: []const u8,
+    payload: ?[]const u8,
+};
+
+pub fn parseActionLabel(label: []const u8) ParsedActionLabel {
+    var split_idx: ?usize = null;
+    var kind: u8 = 0;
+    for (label, 0..) |c, idx| {
+        if (c == '(' or c == '{' or c == ':' or c == ' ') {
+            split_idx = idx;
+            kind = c;
+            break;
         }
-        return .{ .name = label[0..p_open], .payload = null };
+    }
+    if (split_idx) |idx| {
+        const name = label[0..idx];
+        var payload_slice: []const u8 = undefined;
+        if (kind == '(') {
+            if (std.mem.lastIndexOfScalar(u8, label, ')')) |p_close| {
+                if (p_close > idx) {
+                    payload_slice = label[idx + 1 .. p_close];
+                } else {
+                    payload_slice = label[idx + 1 ..];
+                }
+            } else {
+                payload_slice = label[idx + 1 ..];
+            }
+        } else if (kind == '{') {
+            if (std.mem.lastIndexOfScalar(u8, label, '}')) |b_close| {
+                if (b_close > idx) {
+                    payload_slice = label[idx + 1 .. b_close];
+                } else {
+                    payload_slice = label[idx + 1 ..];
+                }
+            } else {
+                payload_slice = label[idx + 1 ..];
+            }
+        } else {
+            payload_slice = label[idx + 1 ..];
+        }
+        const trimmed = std.mem.trim(u8, payload_slice, " \t\r\n");
+        if (trimmed.len == 0) {
+            return .{ .name = name, .payload = null };
+        }
+        return .{ .name = name, .payload = trimmed };
     }
     return .{ .name = label, .payload = null };
 }
 
-fn isJsonNumber(str: []const u8) bool {
-    if (str.len == 0) return false;
+fn isStrictJsonNumber(s: []const u8) bool {
+    if (s.len == 0) return false;
     var i: usize = 0;
-    if (str[0] == '-') i += 1;
-    if (i >= str.len) return false;
-    while (i < str.len) : (i += 1) {
-        if (str[i] < '0' or str[i] > '9') return false;
+    if (s[0] == '-') {
+        i += 1;
+        if (i >= s.len) return false;
     }
-    return true;
+    if (s[i] == '0') {
+        i += 1;
+        if (i < s.len and s[i] >= '0' and s[i] <= '9') return false;
+    } else if (s[i] >= '1' and s[i] <= '9') {
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+    } else {
+        return false;
+    }
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        if (i >= s.len or s[i] < '0' or s[i] > '9') return false;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+    }
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        if (i >= s.len or s[i] < '0' or s[i] > '9') return false;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+    }
+    return i == s.len;
+}
+
+fn appendJsonPayload(out: *std.ArrayList(u8), allocator: std.mem.Allocator, p_str: []const u8) !void {
+    if (std.mem.eql(u8, p_str, "true") or std.mem.eql(u8, p_str, "false") or std.mem.eql(u8, p_str, "null")) {
+        try out.appendSlice(allocator, p_str);
+        return;
+    }
+    if (isStrictJsonNumber(p_str)) {
+        const max_safe_int: i64 = 9007199254740991;
+        const min_safe_int: i64 = -9007199254740991;
+        if (std.fmt.parseInt(i64, p_str, 10)) |val| {
+            if (val > max_safe_int or val < min_safe_int) {
+                try out.appendSlice(allocator, "{\"#bigint\": \"");
+                try out.appendSlice(allocator, p_str);
+                try out.appendSlice(allocator, "\"}");
+                return;
+            }
+        } else |_| {}
+        try out.appendSlice(allocator, p_str);
+        return;
+    }
+    try appendJsonEscapedString(out, allocator, p_str);
 }
 
 pub const RenderItfOptions = struct {
@@ -805,4 +898,98 @@ test "Picture.verifyCoverage rejects coverage when action only appeared in rejec
         .note = "",
     });
     try pic.verifyCoverage(Act);
+}
+
+test "Picture edge deduplication updates rejected state when edge is later accepted" {
+    const allocator = std.testing.allocator;
+    const Act = enum { ping };
+
+    var pic = Picture{ .record_steps = false };
+    defer pic.deinit(allocator);
+
+    // First observe ping as rejected unchanged edge
+    try pic.observe(allocator, .{
+        .before = "idle",
+        .after = "idle",
+        .label = "ping",
+        .rejected = true,
+        .mutated = false,
+        .keep_unchanged = true,
+        .note = "",
+    });
+    try std.testing.expectError(error.ActUncovered, pic.verifyCoverage(Act));
+
+    // Then observe ping on the identical (idle, ping, idle) edge as accepted
+    try pic.observe(allocator, .{
+        .before = "idle",
+        .after = "idle",
+        .label = "ping",
+        .rejected = false,
+        .mutated = false,
+        .keep_unchanged = true,
+        .note = "",
+    });
+    // Deduplicated edge must have rejected = false now
+    try pic.verifyCoverage(Act);
+}
+
+test "Picture.renderItfJson emits valid JSON numbers and adheres to ADR-015 vars schema" {
+    const allocator = std.testing.allocator;
+    var pic = Picture{};
+    defer pic.deinit(allocator);
+
+    try pic.observe(allocator, .{
+        .before = "s0",
+        .after = "s1",
+        .label = "set(007)",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+    try pic.observe(allocator, .{
+        .before = "s1",
+        .after = "s2",
+        .label = "stop()",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+    try pic.observe(allocator, .{
+        .before = "s2",
+        .after = "s3",
+        .label = "big(9007199254740992)",
+        .rejected = false,
+        .mutated = true,
+        .note = "",
+    });
+
+    const itf = try pic.renderItfJson(allocator, .{});
+    defer allocator.free(itf);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, itf, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const vars = root.get("vars").?.array;
+    try std.testing.expectEqual(@as(usize, 4), vars.items.len);
+    try std.testing.expectEqualStrings("state", vars.items[0].string);
+    try std.testing.expectEqualStrings("action", vars.items[1].string);
+    try std.testing.expectEqualStrings("mbt::actionTaken", vars.items[2].string);
+    try std.testing.expectEqualStrings("payload", vars.items[3].string);
+
+    const states = root.get("states").?.array;
+    try std.testing.expectEqual(@as(usize, 4), states.items.len);
+
+    // Initial state 0 has payload: null
+    try std.testing.expect(states.items[0].object.get("payload").? == .null);
+
+    // State 1: set(007) has leading zero so emitted as string "007"
+    try std.testing.expectEqualStrings("007", states.items[1].object.get("payload").?.string);
+
+    // State 2: stop() has null payload
+    try std.testing.expect(states.items[2].object.get("payload").? == .null);
+
+    // State 3: bigint has #bigint wrapper
+    const bigint_obj = states.items[3].object.get("payload").?.object;
+    try std.testing.expectEqualStrings("9007199254740992", bigint_obj.get("#bigint").?.string);
 }
