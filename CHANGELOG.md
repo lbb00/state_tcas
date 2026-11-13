@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Sectional / Block-Level Specification Locking (`st.tla`)**:
+  - `formatDeclarationSectionWithMarkers` / `formatDeclarationSection`: Format declaration blocks enclosed by section markers (`\* BEGIN DECLARATIONS` ... `\* END DECLARATIONS` or custom markers via `options.section`), allowing custom variables, initial state predicates, transition relations, and invariants to live alongside auto-generated constants and vocabularies within a single `.tla` specification file.
+  - `lockWithOptions`: Line-anchored automatic detection and in-place updating of sectional blocks without overwriting user-authored formulas or module definitions outside the block, maintaining byte-level golden locks and CRLF line ending preservation.
+- **Pure-Zig Lightweight TLA+ Spec Syntax Validator (`st.tla`)**:
+  - `validateSpecSyntax`: In-process structural syntax validator for TLA+ modules without external Java, TLC, or SANY runtime dependencies. Validates line-anchored module headers (`---- MODULE <Name> ----`), footers (`====`), balanced delimiters (`()`, `[]`, `{}`, `<<>>`), unclosed strings, and unclosed nested comments, while ignoring pre-module and post-footer notes.
+- **Direct Action Coverage Verification (`st.picture`, `st.tla`)**:
+  - `Picture.verifyCoverage(Act)`: Verify that every defined variant of `Act` was exercised in recorded edges or sequence steps (`error.ActUncovered`), skipping rejected steps and supporting tagged union actions with payloads.
+  - `ReplayStats.verifyCoverage(Act, pic)`: One-line coverage assertion on trace replay statistics.
+- **Apalache ADR-015 ITF Trace Export (`st.picture`)**:
+  - `Picture.renderItfJson`: Render recorded exploration steps as standard Apalache ADR-015 compliant Informal Trace Format (ITF) JSON traces with step continuity verification (`error.DiscontinuousTrace`, `error.EmptyTrace`), skipping rejected steps, and emitting `mbt::actionTaken` annotations.
+- **Custom State Variable Configuration (`st.picture`, `st.tla`)**:
+  - `RenderItfOptions.state_var_name` and `ReplayOptions.state_var_name`: Configure custom primary state variable name for ITF export and trace replay, validated against reserved keywords via `validateStateVarName` (`error.InvalidStateVariableName`).
+- **Rejection State Immutability & Deep Cloning (`st.tla`)**:
+  - `error.RejectedButMutated`: Rejection immutability verification ensuring that trace steps explicitly asserting `rejected: true` do not mutate the harness state snapshot.
+  - `deepClone`: Deep recursive allocator-based cloning for slices (including sentinel-terminated and aligned slices), single-item pointers, structs (skipping comptime fields), arrays, optionals, and tagged unions.
+
+### Changed
+
+- **Trace Replay Verification Strictness (`st.tla`)**:
+  - In `replayJsonTraceWithOptions`, detect custom state variables in JSON/ITF step objects that are not checked by scalar/enum projections, raising `error.TraceVariablesUnverified` by default to prevent false confidence when a trace specifies multi-variable state assertions. Added `allow_unverified_variables: bool = false` to `ReplayOptions` for explicit opt-in.
+  - Trace event fields (`before`, `rejected`) emitted by serializers are now actively verified: mismatched `before` projections return `error.TraceDiverged`, and unfulfilled rejections return `error.RejectionExpected`.
+  - `before` assertion verification aligns trace ingest validation and step execution against the primary state variable, rejecting incompatible projections early with `error.ProjectionUnavailable`.
+  - Disallowed infrastructure errors (e.g. `OutOfMemory`) take precedence over mutation checks during rejected steps.
+
+### Fixed
+
+- **Large Integer Bigint Serialization (`st.picture`)**:
+  - Wrapped integers beyond 64-bit safe bounds into ADR-015 `{"#bigint": "..."}` objects upon parse overflow in `appendJsonPayload`.
+- **Allocation-Free `parseAct` for Zig 0.17 (`st.tla`)**:
+  - Refactored `parseAct` to use `std.meta.stringToEnum` for enum actions and inline inspection for void union variants without invoking heap allocators, resolving compatibility with Zig 0.17 std library.
+
 ## [0.3.0] - 2026-11-11
 
 ### Added
